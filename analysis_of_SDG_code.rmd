@@ -1,0 +1,3232 @@
+---
+title: "Analysis of the evolution of the Sustainable Development Goals (SDGs) using
+  \  distance-based and depth-based tools."
+author: "Daniel Carretero Álvarez"
+date: "2023-07-25"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Librerías necesarias
+
+```{r,warning=FALSE,message=FALSE}
+library(readxl)
+library(tidyr)
+library(dplyr)
+library(roahd)
+library(data.table)
+library(Amelia)
+library(viridis)
+library(plotly)
+library(pracma)
+```
+
+
+# Cleaning the dataset: first steps
+
+To begin the analysis, we will read the 'datos_ODS_modificados.csv' file, which is a consolidated dataset formed by combining the 17 individual Excel documents. The previously mentioned empty columns have been removed. We will load this file into our analysis environment to proceed with further exploration and analysis.
+
+```{r}
+#sdg1 <- read.csv('datos_ODS_modificados.csv')
+#sdg1 <- read.csv('datos_ODS_modificados2.csv')
+
+sdg1 <- read.csv('datos_ODS_modificados3.csv')
+head(sdg1[,2:8])
+```
+
+We will focus solely on the data pertaining to the general population of each country. Therefore, we will filter the dataset by selecting only the observations that have values for BOTHSEX, ALLAGE, and ALLAREA, while removing the unnecessary columns.
+
+```{r, warning=FALSE}
+sdg1.indi5 <- sdg1[sdg1$Goal==5,]
+
+sdg2.1 <- sdg1.indi5 %>% filter( Sex %in% c('FEMALE',NA),Age %in% c('ALLAGE',NA),
+                            Location %in% c('ALLAREA',NA), Units != 'NUMBER')
+
+sdg1.else <- sdg1[sdg1$Goal !=5,]
+
+sdg2.2 <- sdg1.else %>% filter( Sex %in% c('BOTHSEX',NA),Age %in% c('ALLAGE',NA), Location %in% c('ALLAREA',NA), !Units %in% c('NUMBER','CU_USD','CU_USD_M','CON_USD_M','CON_USD','CUR_LCU_M','KMSQ','HA_TH','NUM_M','NUM_TH','M_M3_PER_YR','KG_PER_CON_USD','TONNES'))
+
+
+sdg2 <- rbind(sdg2.1,sdg2.2)
+sdg3 <- sdg2[c(2,3,4,5)]
+sdg3$Value <- as.numeric(sdg3$Value)
+sdg3 <- sdg3[sdg3$TimePeriod <= 2022,]
+```
+
+We have encountered our first issue, where some observations are repeated with the same values. For example, in the case of Argentina in 2010 for indicator 1.3.1, there are seven different values. To address this, we will calculate the average of the data from these repeated observations.
+
+```{r}
+setDT(sdg3)
+sdg4 <- sdg3[, .(mean_value = mean(Value, na.rm = TRUE)), by = .(Indicator, GeoAreaName, TimePeriod)]
+```
+
+We will now restructure our dataset by transforming the indicators from rows to columns. This will allow us to organize our time series more efficiently, with each sub-indicator represented as a separate variable.
+
+```{r}
+sdg5 <- as.data.frame(sdg4)
+sdg6 <- pivot_wider(sdg5, id_cols = c(GeoAreaName,TimePeriod),
+                       names_from = Indicator, values_from = mean_value,values_fn =  NULL)
+```
+
+As we can observe, there are missing years for many countries and indicators in our dataset. In order to complete the dataset, we need to include every year for each country and indicator. For the missing observations, we will fill the values with NA to indicate the absence of data.
+
+```{r}
+# Create a list with all the combinations of country and year.
+combinations <- expand.grid(GeoAreaName=unique(sdg5$GeoAreaName),
+                                TimePeriod=unique(sdg5$TimePeriod))
+
+# Merge the list with the original dataset, keeping all the combinations.
+df_complete <- merge(sdg6, combinations, by=c("GeoAreaName", "TimePeriod"), all=TRUE)
+```
+
+We perform a chronological time ordering:
+
+```{r}
+# sorting bycountry and year
+sdg7 <- arrange(df_complete, GeoAreaName, TimePeriod)
+```
+
+# Table of missing data
+
+We are going to generate a table that presents the percentage of missing data for each country and indicator in our dataset. This table will serve as a valuable tool for assessing the extent of missing information in our data and understanding the data quality and completeness for different countries and indicators, allowing us to identify areas of the dataset that may be lacking in sufficient data, potentially affecting the reliability and accuracy of our analysis.
+
+```{r}
+
+missing_data <- sdg7 %>%
+  group_by(GeoAreaName) %>%
+  summarise_all(~sum(is.na(.))/n()*100) %>%
+  pivot_longer(cols = -GeoAreaName, names_to = "indicador", values_to = "porcentaje")
+
+missing_data_table <- pivot_wider(missing_data, names_from = indicador, values_from = porcentaje)
+missing_data_table <- as.data.frame(missing_data_table)
+
+missing_matrix <- as.matrix(missing_data_table[,-c(1,2)])
+hm <- heatmap(missing_matrix, xlab = "Indicators", ylab = "Countries",
+        main = "Heatmap of Data",col = plasma(256))
+
+reordered_matrix <- missing_matrix[hm$rowInd,hm$colInd]
+
+nombres <- sapply(strsplit(colnames(reordered_matrix),':'), function(x) x[1])
+
+heatmap <- plot_ly(
+  z = reordered_matrix,
+  x= nombres,
+  y= missing_data_table$GeoAreaName[hm$rowInd],
+  type = "heatmap",
+  colorscale = "Viridis"
+)
+
+layout <- list(
+  title = "Percentage of missing data"
+)
+
+heatmap <- heatmap %>% layout(title = layout$title)
+
+
+# Show the heatmap
+heatmap
+```
+
+# Filtering by indicators and countries
+
+We will now apply a series of filters to select only the countries and indicators that have sufficient data for analysis.
+
+In this initial filter, we will exclude countries with more than 90% missing data.
+
+```{r}
+####################
+### First Filter ###
+####################
+
+num_cols <- sapply(missing_data_table, is.numeric)
+df_num <- missing_data_table[, num_cols]
+
+color_palette <- colorRampPalette(c("blue", "green", "yellow", "red"))
+
+means <- rowMeans(df_num, na.rm = TRUE)
+point_colors <- color_palette(length(means))[cut(means, length(means))]
+
+plot(means, col = point_colors, pch = 19, xlab = "Country", ylab = "Mean Percentage of Missing Data", main = "First filter: Percentage of Missing Data by Country")
+abline(h = 90, col = "red", lty = 2)
+legend("topright", legend = c("Threshold (90%)"), col = c("red"), lty = c(2), bg = "white")
+
+
+lower80 <- which(means <=90)
+
+missing_data_table2 <- missing_data_table[c(lower80),]
+```
+
+The plot above illustrates that a significant number of countries did not meet the threshold for selection.
+
+In this second filter, we will exclude indicators with more than 85% missing data.
+
+```{r}
+#####################
+### Second Filter ###
+#####################
+num_cols2 <- sapply(missing_data_table2, is.numeric)
+df_num2 <- missing_data_table2[, num_cols2]
+
+mean_values <- colMeans(df_num2, na.rm = TRUE)
+
+point_colors <- color_palette(length(mean_values))[cut(mean_values, length(mean_values))]
+
+plot(mean_values, col = point_colors, pch = 19, xlab = "Indicator", ylab = "Mean Percentage of Missing Data", main = "Second filter: Percentage of Missing Data by Indicator")
+abline(h = 85, col = "red", lty = 2)
+legend("topright", legend = c("Threshold (85%)"), col = c("red"), lty = c(2), bg = "white")
+
+
+
+lower60 <- names(mean_values[mean_values <=85])
+
+indicator_table <- missing_data_table2[,c('GeoAreaName',lower60)]
+```
+
+Once again, we observe that nearly half of the indicators do not have sufficient data.
+
+In this third filter, we will exclude countries with more than 60 missing data.
+
+```{r}
+####################
+### Third Filter ###
+####################
+
+num_cols3 <- sapply(indicator_table, is.numeric)
+df_num3 <- indicator_table[, num_cols3]
+
+means2 <- rowMeans(df_num3, na.rm = TRUE)
+
+point_colors <- color_palette(length(means2))[cut(means2, length(means2))]
+
+plot(means2, col = point_colors, pch = 19, xlab = "Country", ylab = "Mean Percentage of Missing Data", main = "Third filter: Percentage of Missing Data by Country")
+abline(h = 60, col = "red", lty = 2)
+legend("topright", legend = c("Threshold (60%)"), col = c("red"), lty = c(2), bg = "white")
+
+lower40 <- which(means2<=60)
+
+missing_data_table3  <- indicator_table[c(lower40),]
+```
+
+A few more countries were discarded, resulting in our final list of countries.
+
+In this last filter, we will exclude indicators with more than 60 missing data.
+
+```{r}
+#####################
+### Fourth Filter ###
+#####################
+num_cols4 <- sapply(missing_data_table3, is.numeric)
+df_num4 <- missing_data_table3[, num_cols4]
+
+
+mean_values2 <- colMeans(df_num4, na.rm = TRUE)
+point_colors <- color_palette(length(mean_values2))[cut(mean_values2, length(mean_values2))]
+
+plot(mean_values2, col = point_colors, pch = 19, xlab = "Indicator", ylab = "Mean Percentage of Missing Data", main = "Fourth filter: Percentage of Missing Data by Indicator")
+abline(h = 70, col = "red", lty = 2)
+legend("topright", legend = c("Threshold (70%)"), col = c("red"), lty = c(2), bg = "white")
+
+lower40_2 <- names(mean_values2[mean_values2 <=65])
+
+
+indicator_table2 <- missing_data_table3[,c('GeoAreaName',lower40_2)]
+
+dim(indicator_table2)
+```
+
+
+We have narrowed down the dataset to 178 countries and 122/126 indicators. However, we have encountered a small problem: there is insufficient data for any of the sub-indicators of SDGs 5, 11 and 13. This implies a challenge when we later want to provide a summary of the 17 key goals. To address this issue, we can manually add some indicators that have the most available data.
+
+We save the new subset of data with the selected columns and rows.
+
+```{r}
+countries_with_data <- indicator_table2$GeoAreaName
+indicators_with_data <- names(indicator_table2)[-c(1,2)]
+
+
+sdg8 <- sdg7[sdg7$GeoAreaName %in% countries_with_data,
+                     c('GeoAreaName', 'TimePeriod',indicators_with_data)]
+```
+
+MIRAR DE NUEVO: 
+
+```{r}
+datos_indicadores <- sdg8[, -c(1,2)]
+
+# Crear histogramas para cada columna
+par(mfrow = c(3, 3))  # Configurar la cuadrícula para mostrar los histogramas en 2 filas y 4 columnas
+for (i in 1:ncol(datos_indicadores)) {
+  hist(datos_indicadores[, i], main = colnames(datos_indicadores)[i], xlab = "Valor", ylab = "Frecuencia")
+}
+par(mfrow = c(1,1))
+```
+
+
+```{r, eval=FALSE,echo=FALSE}
+
+sdg9 <- sdg8
+
+#sdg9$`1.5.1` <- log(sdg9$`1.5.1`)
+need_log1p <- c(F,F,T,F,F,T,T,T,F,T,F,F,F,F,F,F,T,T,T,F,F,T,T,F,T,T,T,F,F,T,F,F,
+                F,F,F,F,T,F,T,T,F,T,F,T,T,T,F,F,F,T,T,F,T,T,F,F,F,T,F,F,F,T,T,T,
+                F,F,F,F,T,F,F,F,F,T,F,T,T,T,T,F,T,T,T,T,F,F,F,F,F,T,F,F,F,T,T,F,
+                F,F,F,F,T,F,T,T,F,F,F,T,F,F,F,F,F,F,T,T,T,T,T,F)
+variables <- names(sdg8[,-(1:2)])[need_log1p]
+
+for (variable in variables) {
+  #print(variable)
+  sdg9[[variable]] <- log1p(sdg9[[variable]])
+}
+```
+
+```{r, eval=FALSE, echo=FALSE}
+datos_indicadores <- sdg9[, -c(1,2)]
+# Crear histogramas para cada columna
+par(mfrow = c(3, 3))  # Configurar la cuadrícula para mostrar los histogramas en 2 filas y 4 columnas
+for (i in 1:ncol(datos_indicadores)) {
+  hist(datos_indicadores[, i], main = colnames(datos_indicadores)[i], xlab = "Valor", ylab = "Frecuencia")
+}
+par(mfrow = c(1,1))
+```
+
+```{r}
+#data_sdg <- sdg9 
+data_sdg <- sdg8
+```
+
+# Filling missing data: countries indicators with high (but incomplete) data
+
+To fill in the missing data, we will implement a two-step approach. The first step involves filling the country indicators that have more than 50% of available data using a quadratic regression method. This regression model will help us estimate the missing values based on the existing data points, allowing us to complete the dataset more accurately.
+
+```{r}
+tabla_porcentajes <- as.data.frame(indicator_table2)
+#head(tabla_porcentajes)
+#head(data_sdg)
+
+hm <- heatmap(as.matrix(tabla_porcentajes[,-c(1,2)]))
+
+
+
+missing_matrix <- as.matrix(tabla_porcentajes[,-c(1,2)])
+
+reordered_matrix <- missing_matrix[hm$rowInd,hm$colInd]
+
+
+
+nombres <- sapply(strsplit(colnames(reordered_matrix),':'), function(x) x[1])
+
+heatmap <- plot_ly(
+  z = reordered_matrix,
+  x= nombres,
+  y= tabla_porcentajes$GeoAreaName[hm$rowInd],
+  type = "heatmap",
+  colorscale = "Viridis"
+)
+
+layout <- list(
+  title = "Percentage of missing data"
+)
+
+heatmap <- heatmap %>% layout(title = layout$title)
+
+
+# Show the heatmap
+heatmap
+```
+
+
+```{r}
+coordenadas <- which(tabla_porcentajes > 35 & class(tabla_porcentajes)!="character", arr.ind = TRUE)
+#head(coordenadas)
+coordenadas80 <- coordenadas[-(1:(dim(tabla_porcentajes)[1])),]
+#head(coordenadas80)
+dimtab <- dim(tabla_porcentajes)-c(0,2)
+# Porcentaje de datos que tendré que rellenar comparando con paises cercanos.
+100*dim(coordenadas80)[1]/(dimtab[1]*dimtab[2])
+
+sin_datos_suficientes <- data.frame(
+  Pais = tabla_porcentajes[,1][coordenadas80[, 1]],
+  Indicador = colnames(tabla_porcentajes)[coordenadas80[, 2]]
+)
+
+
+coordenadas <- which(tabla_porcentajes <= 65 & class(tabla_porcentajes)!="character", arr.ind = TRUE)
+#head(coordenadas)
+coordenadas80 <- coordenadas[-(1:dim(tabla_porcentajes)[1]),]
+#head(coordenadas80)
+dimtab <- dim(tabla_porcentajes)-c(0,2)
+100*dim(coordenadas80)[1]/(dimtab[1]*dimtab[2])
+
+con_datos <- data.frame(
+  Pais = tabla_porcentajes[,1][coordenadas80[, 1]],
+  Indicador = colnames(tabla_porcentajes)[coordenadas80[, 2]]
+)
+
+lista_parejas <- lapply(1:nrow(con_datos), function(i) c(con_datos$Pais[i], con_datos$Indicador[i]))
+
+```
+
+Let's examine some examples where the quadratic regression method performs well, moderately, and poorly in filling the missing data.
+
+Example 1: Filling Albania's indicator 1.a.2:
+
+```{r}
+#valor <- data_sdg[data_sdg$GeoAreaName == 'Albania', '1.a.2']
+valor <- data_sdg[data_sdg$GeoAreaName == 'Albania', '1.a.2: Proportion of total government spending on essential services, education (%)']
+
+year <- 2000:2022
+
+albania <- as.data.frame(cbind(valor, year))
+
+regresion_albania <- lm(valor ~ year, data = albania)
+summary(regresion_albania)
+
+plot(albania$year, albania$valor, xlab = "Year", ylab = "Value", main = "Example: Albania", col = "blue")
+abline(regresion_albania, col = "red")
+
+regresion_albania2 <- lm(valor ~ year + I(year^2), data = albania)
+summary(regresion_albania2)
+
+funalb <- function(x) regresion_albania2$coefficients[1] + regresion_albania2$coefficients[2] * x + regresion_albania2$coefficients[3] * x^2 
+
+curve(funalb, add = TRUE, col = "green", lwd = 2)
+
+indices_faltantes <- which(is.na(albania))
+
+predicciones <- predict(regresion_albania2, newdata = as.data.frame(year))
+
+albania[indices_faltantes, 1] <- predicciones[indices_faltantes]
+
+plot(albania$year, albania$valor, type = "l", xlab = "Year", ylab = "Value", main = "Example: Albania", col = "blue")
+points(albania$year[indices_faltantes], albania$valor[indices_faltantes], col = "red", pch = 16)
+lines(albania$year, albania$valor, col = "blue")
+
+```
+Example 2: Filling Barbados' indicator 2.a.2 (SALE MAL):
+
+```{r}
+valor <- data_sdg[data_sdg$GeoAreaName == 'Barbados', '3.2.1: Infant mortality rate (deaths per 1,000 live births)']
+year <- 2000:2022
+
+barbados <- as.data.frame(cbind(valor, year))
+
+regresion_barbados <- lm(valor ~ year, data = barbados)
+summary(regresion_barbados)
+
+plot(barbados$year, barbados$valor,  xlab = "Year", ylab = "Value", main = "Example: Barbados", col = "blue")
+abline(regresion_barbados, col = "red")
+
+regresion_barbados2 <- lm(valor ~ year + I(year^2), data = barbados)
+summary(regresion_barbados2)
+
+funbar <- function(x) regresion_barbados2$coefficients[1] + regresion_barbados2$coefficients[2] * x + regresion_barbados2$coefficients[3] * x^2 
+
+curve(funbar, add = TRUE, col = "green", lwd = 2)
+
+indices_faltantes <- which(is.na(barbados))
+
+predicciones <- predict(regresion_barbados2, newdata = as.data.frame(year))
+
+barbados[indices_faltantes, 1] <- predicciones[indices_faltantes]
+
+plot(barbados$year, barbados$valor, type = "l", xlab = "Year", ylab = "Value", main = "Example: Barbados", col = "blue")
+points(barbados$year[indices_faltantes], barbados$valor[indices_faltantes], col = "red", pch = 16)
+lines(barbados$year, barbados$valor, col = "blue")
+
+```
+
+Example 1: Filling Burkina Faso's indicator 3.c.1:
+
+```{r}
+valor <- data_sdg[data_sdg$GeoAreaName == 'Burkina Faso', '3.1.2: Proportion of births attended by skilled health personnel (%)']
+year <- 2000:2022
+
+burkina <- as.data.frame(cbind(valor, year))
+
+regresion_burkina <- lm(valor ~ year, data = burkina)
+summary(regresion_burkina)
+
+plot(burkina$year, burkina$valor, xlab = "Year", ylab = "Value", main = "Example: Burkina Faso", col = "blue")
+abline(regresion_burkina, col = "red")
+
+regresion_burkina2 <- lm(valor ~ year + I(year^2), data = burkina)
+summary(regresion_burkina2)
+
+funbur <- function(x) regresion_burkina2$coefficients[1] + regresion_burkina2$coefficients[2] * x + regresion_burkina2$coefficients[3] * x^2
+
+curve(funbur, add = TRUE, col = "green", lwd = 2)
+
+indices_faltantes <- which(is.na(burkina))
+
+predicciones <- predict(regresion_burkina2, newdata = as.data.frame(year))
+
+burkina[indices_faltantes, 1] <- predicciones[indices_faltantes]
+
+plot(burkina$year, burkina$valor, type = "l", xlab = "Year", ylab = "Value", main = "Example: Burkina Faso", col = "blue")
+points(burkina$year[indices_faltantes], burkina$valor[indices_faltantes], col = "red", pch = 16)
+lines(burkina$year, burkina$valor, col = "blue")
+
+```
+
+We will now proceed to iterate the same process described above to fill in all the remaining missing data.During the iteration, we will select each country and indicator, assess the percentage of missing data, and apply the quadratic regression method if the condition is met.
+
+```{r, warning=FALSE,message=FALSE}
+for(pais_indicador in lista_parejas){
+  valor <- data_sdg[data_sdg$GeoAreaName==pais_indicador[1],
+                          pais_indicador[2]]
+  year <- 2000:2022
+  
+  pais <- as.data.frame(cbind(valor,year))
+  
+  regresion_pais <- lm(valor~year+I(year^2),data = pais)
+  
+  indices_faltantes <- which(is.na(pais))
+  
+  predicciones <- predict(regresion_pais,newdata=as.data.frame(year))
+  
+  pais[indices_faltantes,1] <- predicciones[indices_faltantes] 
+
+  data_sdg[data_sdg$GeoAreaName==pais_indicador[1],
+                 pais_indicador[2]] <- pais
+}
+```
+
+Let's examine how the percentage table looks with the updated dataset:
+
+```{r}
+new_data <- data_sdg %>%
+  group_by(GeoAreaName) %>%
+  summarise_all(~sum(is.na(.))/n()*100) %>%
+  pivot_longer(cols = -GeoAreaName, names_to = "indicador", values_to = "porcentaje")
+
+tablita <-as.data.frame(new_data)
+#head(new_data)
+
+tablas <- pivot_wider(new_data, names_from = indicador, values_from = porcentaje)
+#View(tablas)
+tablas_matrix <- as.matrix(tablas[,-c(1,2)])
+hm <- heatmap(tablas_matrix)
+
+missing_matrix <- as.matrix(tablas[,-c(1,2)])
+
+reordered_matrix <- missing_matrix[hm$rowInd,hm$colInd]
+
+
+
+nombres <- sapply(strsplit(colnames(reordered_matrix),':'), function(x) x[1])
+
+heatmap <- plot_ly(
+  z = reordered_matrix,
+  x= nombres,
+  y= tabla_porcentajes$GeoAreaName[hm$rowInd],
+  type = "heatmap",
+  colorscale = "Viridis"
+)
+
+layout <- list(
+  title = "Percentage of missing data"
+)
+
+heatmap <- heatmap %>% layout(title = layout$title)
+
+
+# Show the heatmap
+#heatmap
+
+
+############### AÑADIR HEATMAP INTERACTIVO #######################
+```
+
+
+# Delimiting the data
+
+To ensure realistic bounds for normalization, we will set specific bounds for the data based on the indicator being measured. These bounds may vary depending on the specific indicator.
+
+```{r}
+bounded_data <- data_sdg
+```
+
+```{r}
+######## 5 ############
+
+bounded_data$`5.5.1: Proportion of seats held by women in national parliaments (% of total number of seats)` <- pmin(pmax(bounded_data$`5.5.1: Proportion of seats held by women in national parliaments (% of total number of seats)`, 0), 45)
+
+bounded_data$`5.5.2: Proportion of women in managerial positions - 13th ICLS (%)` <- pmin(pmax(bounded_data$`5.5.2: Proportion of women in managerial positions - 13th ICLS (%)`, 0), 45)
+
+```
+
+```{r}
+################# 1 ##################
+
+bounded_data$`1.1.1: Proportion of population below international poverty line (%)`<- pmin(pmax(bounded_data$`1.1.1: Proportion of population below international poverty line (%)`, 0), quantile(na.omit(data_sdg$`1.1.1: Proportion of population below international poverty line (%)`),0.975))
+
+bounded_data$`1.4.1: Proportion of population using basic drinking water services, by location (%)` <- pmin(pmax(bounded_data$`1.4.1: Proportion of population using basic drinking water services, by location (%)`, quantile(na.omit(data_sdg$`1.4.1: Proportion of population using basic drinking water services, by location (%)`),0.025)), 100)
+
+bounded_data$`1.4.1: Proportion of population using basic sanitation services, by location (%)` <- pmin(pmax(bounded_data$`1.4.1: Proportion of population using basic sanitation services, by location (%)`, 0), 100)
+
+# no bound for the other 1.4.1
+
+bounded_data$`1.a.1: Official development assistance grants for poverty reduction, by recipient countries (percentage of GNI)`<- pmin(pmax(bounded_data$`1.a.1: Official development assistance grants for poverty reduction, by recipient countries (percentage of GNI)`, 0), quantile(na.omit(data_sdg$`1.a.1: Official development assistance grants for poverty reduction, by recipient countries (percentage of GNI)`),0.975))
+
+bounded_data$`1.a.2: Proportion of total government spending on essential services, education (%)`<- pmin(pmax(bounded_data$`1.a.2: Proportion of total government spending on essential services, education (%)`, quantile(na.omit(data_sdg$`1.a.2: Proportion of total government spending on essential services, education (%)`),0.025) ), quantile(na.omit(data_sdg$`1.a.2: Proportion of total government spending on essential services, education (%)`),0.975))
+
+
+# logarithm transformation? bounding? I don't know what to do
+bounded_data$`1.5.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`<-pmin(log1p(pmax(bounded_data$`1.5.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`,0)),quantile(na.omit(log1p(pmax(data_sdg$`1.5.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`,0))),0.975))
+
+bounded_data$`1.5.1: Number of directly affected persons attributed to disasters per 100,000 population (number)` <- pmin(log1p(pmax(bounded_data$`1.5.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`,0)),quantile(na.omit(log1p(pmax(data_sdg$`1.5.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`,0))),0.975))
+
+
+```
+
+```{r}
+##################### 2 ##############
+
+
+bounded_data$`2.1.1: Prevalence of undernourishment (%)`<- pmin(pmax(bounded_data$`2.1.1: Prevalence of undernourishment (%)`, 0), quantile(na.omit(data_sdg$`2.1.1: Prevalence of undernourishment (%)`),0.975))
+
+#bounded_data$`2.2.1: Proportion of children moderately or severely stunted (%)`
+
+bounded_data$`2.2.2: Proportion of children moderately or severely overweight (%)` <- pmin(pmax(bounded_data$`2.2.2: Proportion of children moderately or severely overweight (%)`
+,0),quantile(na.omit(data_sdg$`2.2.2: Proportion of children moderately or severely overweight (%)`),0.975))
+
+bounded_data$`2.2.3: Proportion of women aged 15-49 years with anaemia (%)` <- pmin(pmax(bounded_data$`2.2.3: Proportion of women aged 15-49 years with anaemia (%)`,quantile(na.omit(data_sdg$`2.2.3: Proportion of women aged 15-49 years with anaemia (%)`),0.025)),quantile(na.omit(data_sdg$`2.2.3: Proportion of women aged 15-49 years with anaemia (%)`),0.975))
+
+bounded_data$`2.2.3: Proportion of women aged 15-49 years with anaemia, non-pregnant (%)` <- pmin(pmax(bounded_data$`2.2.3: Proportion of women aged 15-49 years with anaemia, non-pregnant (%)`,quantile(na.omit(data_sdg$`2.2.3: Proportion of women aged 15-49 years with anaemia, non-pregnant (%)`),0.025)),quantile(na.omit(data_sdg$`2.2.3: Proportion of women aged 15-49 years with anaemia, non-pregnant (%)`),0.975))
+
+bounded_data$`2.2.3: Proportion of women aged 15-49 years with anaemia, pregnant (%)` <- pmin(pmax(bounded_data$`2.2.3: Proportion of women aged 15-49 years with anaemia, pregnant (%)`,quantile(na.omit(data_sdg$`2.2.3: Proportion of women aged 15-49 years with anaemia, pregnant (%)`),0.025)),quantile(na.omit(data_sdg$`2.2.3: Proportion of women aged 15-49 years with anaemia, pregnant (%)`),0.975))
+
+bounded_data$`2.5.2: Proportion of local breeds classified as being at risk as a share of local breeds with known level of extinction risk (%)` <- pmin(pmax(bounded_data$`2.5.2: Proportion of local breeds classified as being at risk as a share of local breeds with known level of extinction risk (%)`, 0), 100)
+
+bounded_data$`2.a.1: Agriculture orientation index for government expenditures`  <- pmin(pmax(bounded_data$`2.a.1: Agriculture orientation index for government expenditures`, 0), quantile(na.omit(data_sdg$`2.a.1: Agriculture orientation index for government expenditures`),0.975))
+
+bounded_data$`2.a.1: Agriculture share of Government Expenditure (%)` <-pmin(pmax(bounded_data$`2.a.1: Agriculture share of Government Expenditure (%)`, quantile(na.omit(data_sdg$`2.a.1: Agriculture share of Government Expenditure (%)`),0.025)), quantile(na.omit(data_sdg$`2.a.1: Agriculture share of Government Expenditure (%)`),0.975))
+
+bounded_data$`2.a.1: Agriculture value added share of GDP (%)` <- pmin(pmax(bounded_data$`2.a.1: Agriculture value added share of GDP (%)`, quantile(na.omit(data_sdg$`2.a.1: Agriculture value added share of GDP (%)`),0.025)), quantile(na.omit(data_sdg$`2.a.1: Agriculture value added share of GDP (%)`),0.975)
+)
+
+bounded_data$`2.c.1: Indicator of Food Price Anomalies (IFPA), by Consumer Food Price Index` <-  pmin(pmax(bounded_data$`2.c.1: Indicator of Food Price Anomalies (IFPA), by Consumer Food Price Index`, quantile(na.omit(data_sdg$`2.c.1: Indicator of Food Price Anomalies (IFPA), by Consumer Food Price Index`),0.025)), quantile(na.omit(data_sdg$`2.c.1: Indicator of Food Price Anomalies (IFPA), by Consumer Food Price Index`),0.975))
+
+
+```
+
+```{r}
+################# 3 #######################
+
+bounded_data$`3.1.2: Proportion of births attended by skilled health personnel (%)` <- pmin(pmax(bounded_data$`3.1.2: Proportion of births attended by skilled health personnel (%)` , quantile(na.omit(data_sdg$`3.1.2: Proportion of births attended by skilled health personnel (%)`),0.025)), 100)
+
+bounded_data$`3.2.1: Infant mortality rate (deaths per 1,000 live births)`<- pmin(pmax(log1p(bounded_data$`3.2.1: Infant mortality rate (deaths per 1,000 live births)`),quantile(na.omit(pmax(log1p(bounded_data$`3.2.1: Infant mortality rate (deaths per 1,000 live births)`),0)),0.025)),quantile(na.omit(pmax(log1p(bounded_data$`3.2.1: Infant mortality rate (deaths per 1,000 live births)`),0)),0.975))
+
+bounded_data$`3.2.1: Under-five mortality rate, by sex (deaths per 1,000 live births)` <- pmin(pmax(log1p(bounded_data$`3.2.1: Under-five mortality rate, by sex (deaths per 1,000 live births)`),quantile(na.omit(log1p(bounded_data$`3.2.1: Under-five mortality rate, by sex (deaths per 1,000 live births)`)),0.025)),quantile(na.omit(log1p(bounded_data$`3.2.1: Under-five mortality rate, by sex (deaths per 1,000 live births)`)),0.975))
+
+bounded_data$`3.2.2: Neonatal mortality rate (deaths per 1,000 live births)`<- pmin(pmax(log1p(bounded_data$`3.2.2: Neonatal mortality rate (deaths per 1,000 live births)`
+),quantile(na.omit(log1p(bounded_data$`3.2.2: Neonatal mortality rate (deaths per 1,000 live births)`)),0.025)),quantile(na.omit(log1p(bounded_data$`3.2.2: Neonatal mortality rate (deaths per 1,000 live births)`)),0.975))
+
+bounded_data$`3.3.1: Number of new HIV infections per 1,000 uninfected population, by sex and age (per 1,000 uninfected population)`<-pmin(pmax(log1p(bounded_data$`3.3.1: Number of new HIV infections per 1,000 uninfected population, by sex and age (per 1,000 uninfected population)`
+),quantile(na.omit(log1p(bounded_data$`3.3.1: Number of new HIV infections per 1,000 uninfected population, by sex and age (per 1,000 uninfected population)`)),0.025)),quantile(na.omit(log1p(bounded_data$`3.3.1: Number of new HIV infections per 1,000 uninfected population, by sex and age (per 1,000 uninfected population)`)),0.975))
+
+bounded_data$`3.3.2: Tuberculosis incidence (per 100,000 population)` <- pmin(pmax(log1p(pmax(bounded_data$`3.3.2: Tuberculosis incidence (per 100,000 population)`,0)
+),quantile(na.omit(log1p(pmax(bounded_data$`3.3.2: Tuberculosis incidence (per 100,000 population)`,0))),0.025)),quantile(na.omit(log1p(pmax(bounded_data$`3.3.2: Tuberculosis incidence (per 100,000 population)`,0))),0.975))
+
+
+bounded_data$`3.3.3: Malaria incidence per 1,000 population at risk (per 1,000 population)`<-pmin(pmax(log1p(pmax(bounded_data$`3.3.3: Malaria incidence per 1,000 population at risk (per 1,000 population)`,0)
+),quantile(na.omit(log1p(pmax(bounded_data$`3.3.3: Malaria incidence per 1,000 population at risk (per 1,000 population)`,0))),0.025)),quantile(na.omit(log1p(pmax(bounded_data$`3.3.3: Malaria incidence per 1,000 population at risk (per 1,000 population)`,0))),0.975))
+
+
+bounded_data$`3.b.1: Proportion of the target population with access to 3 doses of diphtheria-tetanus-pertussis (DTP3) (%)` <- pmin(pmax(bounded_data$`3.b.1: Proportion of the target population with access to 3 doses of diphtheria-tetanus-pertussis (DTP3) (%)` ,  quantile(na.omit(bounded_data$`3.b.1: Proportion of the target population with access to 3 doses of diphtheria-tetanus-pertussis (DTP3) (%)`),0.025)), quantile(na.omit(bounded_data$`3.b.1: Proportion of the target population with access to 3 doses of diphtheria-tetanus-pertussis (DTP3) (%)`),0.975))
+
+bounded_data$`3.b.1: Proportion of the target population with access to measles-containing-vaccine second-dose (MCV2) (%)` <- pmin(pmax(bounded_data$`3.b.1: Proportion of the target population with access to measles-containing-vaccine second-dose (MCV2) (%)` , 30), quantile(na.omit(bounded_data$`3.b.1: Proportion of the target population with access to measles-containing-vaccine second-dose (MCV2) (%)`),0.975))
+
+
+bounded_data$`3.c.1: Health worker density, by type of occupation (per 10,000 population)` <- pmin(pmax(log1p(pmax(bounded_data$`3.c.1: Health worker density, by type of occupation (per 10,000 population)`,0)
+),quantile(na.omit(log1p(pmax(bounded_data$`3.c.1: Health worker density, by type of occupation (per 10,000 population)`,0))),0.025)),quantile(na.omit(log1p(pmax(bounded_data$`3.c.1: Health worker density, by type of occupation (per 10,000 population)`,0))),0.975))
+
+
+bounded_data$`3.d.1: International Health Regulations (IHR) capacity, by type of IHR capacity (%)` <- pmin(pmax(bounded_data$`3.d.1: International Health Regulations (IHR) capacity, by type of IHR capacity (%)` , 0), 100)
+
+```
+
+```{r}
+############# 4 ###################
+
+bounded_data$`4.1.2: Completion rate, by sex, location, wealth quintile and education level (%)` <- pmin(pmax(bounded_data$`4.1.2: Completion rate, by sex, location, wealth quintile and education level (%)`
+,quantile(na.omit(bounded_data$`4.1.2: Completion rate, by sex, location, wealth quintile and education level (%)`),0.025)),quantile(na.omit(bounded_data$`4.1.2: Completion rate, by sex, location, wealth quintile and education level (%)`),0.975))
+
+bounded_data$`4.2.2: Participation rate in organized learning (one year before the official primary entry age), by sex (%)`<-pmin(pmax(bounded_data$`4.2.2: Participation rate in organized learning (one year before the official primary entry age), by sex (%)`,quantile(na.omit(bounded_data$`4.2.2: Participation rate in organized learning (one year before the official primary entry age), by sex (%)`),0.025)),quantile(na.omit(bounded_data$`4.2.2: Participation rate in organized learning (one year before the official primary entry age), by sex (%)`),0.975))
+
+bounded_data$`4.5.1: Adjusted gender parity index for participation rate in organized learning (one year before the official primary entry age), (ratio)` <- pmin(pmax(bounded_data$`4.5.1: Adjusted gender parity index for participation rate in organized learning (one year before the official primary entry age), (ratio)`,quantile(na.omit(bounded_data$`4.5.1: Adjusted gender parity index for participation rate in organized learning (one year before the official primary entry age), (ratio)`),0.025)),quantile(na.omit(bounded_data$`4.5.1: Adjusted gender parity index for participation rate in organized learning (one year before the official primary entry age), (ratio)`),0.975))
+
+bounded_data$`4.c.1: Proportion of teachers with the minimum required qualifications, by education level and sex (%)` <- pmin(pmax(bounded_data$`4.c.1: Proportion of teachers with the minimum required qualifications, by education level and sex (%)`, quantile(na.omit(bounded_data$`4.c.1: Proportion of teachers with the minimum required qualifications, by education level and sex (%)`),0.025)),100)
+
+bounded_data$`4.3.1: Participation rate in formal and non-formal education and training, by sex (%)` <- pmin(pmax(bounded_data$`4.3.1: Participation rate in formal and non-formal education and training, by sex (%)`
+,quantile(na.omit(bounded_data$`4.3.1: Participation rate in formal and non-formal education and training, by sex (%)`),0.025)),quantile(na.omit(bounded_data$`4.3.1: Participation rate in formal and non-formal education and training, by sex (%)`),0.975))
+
+
+bounded_data$`4.5.1: Adjusted gender parity index for participation rate in formal and non-formal education and training (ratio)` <- pmin(pmax(bounded_data$`4.5.1: Adjusted gender parity index for participation rate in formal and non-formal education and training (ratio)`,quantile(na.omit(bounded_data$`4.5.1: Adjusted gender parity index for participation rate in formal and non-formal education and training (ratio)`),0.025)),quantile(na.omit(bounded_data$`4.5.1: Adjusted gender parity index for participation rate in formal and non-formal education and training (ratio)`),0.975))
+
+
+bounded_data$`4.5.1: Adjusted gender parity index for completion rate, by location, wealth quintile and education level` <- pmin(pmax(bounded_data$`4.5.1: Adjusted gender parity index for completion rate, by location, wealth quintile and education level`,quantile(na.omit(bounded_data$`4.5.1: Adjusted gender parity index for completion rate, by location, wealth quintile and education level`),0.025)),quantile(na.omit(bounded_data$`4.5.1: Adjusted gender parity index for completion rate, by location, wealth quintile and education level`),0.975))
+
+bounded_data$`4.5.1: Adjusted gender parity index for the proportion of teachers with the minimum required qualifications, by education level (ratio)`<- pmin(pmax(bounded_data$`4.5.1: Adjusted gender parity index for the proportion of teachers with the minimum required qualifications, by education level (ratio)`
+,quantile(na.omit(bounded_data$`4.5.1: Adjusted gender parity index for the proportion of teachers with the minimum required qualifications, by education level (ratio)`),0.025)),quantile(na.omit(bounded_data$`4.5.1: Adjusted gender parity index for the proportion of teachers with the minimum required qualifications, by education level (ratio)`),0.975))
+
+```
+
+```{r}
+############# 6 ###################
+bounded_data$`6.1.1: Proportion of population using safely managed drinking water services, by urban/rural (%)` <-pmin(pmax(bounded_data$`6.1.1: Proportion of population using safely managed drinking water services, by urban/rural (%)`,quantile(na.omit(bounded_data$`6.1.1: Proportion of population using safely managed drinking water services, by urban/rural (%)`),0.025)),100)
+
+bounded_data$`6.2.1: Proportion of population practicing open defecation, by urban/rural (%)` <- pmin(pmax(bounded_data$`6.2.1: Proportion of population practicing open defecation, by urban/rural (%)`
+,0),quantile(na.omit(bounded_data$`6.2.1: Proportion of population practicing open defecation, by urban/rural (%)`),0.975))
+
+bounded_data$`6.2.1: Proportion of population using safely managed sanitation services, by urban/rural (%)` <- pmin(pmax(bounded_data$`6.2.1: Proportion of population using safely managed sanitation services, by urban/rural (%)`,quantile(na.omit(bounded_data$`6.2.1: Proportion of population using safely managed sanitation services, by urban/rural (%)`),0.025)),100)
+
+bounded_data$`6.4.1: Water Use Efficiency (United States dollars per cubic meter)` <- pmin(pmax(bounded_data$`6.4.1: Water Use Efficiency (United States dollars per cubic meter)`,quantile(na.omit(bounded_data$`6.4.1: Water Use Efficiency (United States dollars per cubic meter)`),0.025)),300)
+
+
+bounded_data$`6.4.2: Level of water stress: freshwater withdrawal as a proportion of available freshwater resources (%)` <- pmin(log1p(pmax(bounded_data$`6.4.2: Level of water stress: freshwater withdrawal as a proportion of available freshwater resources (%)`,0)),5)
+
+
+
+
+
+bounded_data$`6.6.1: Lakes and rivers permanent water area (% of total land area)` <- pmin(pmax(bounded_data$`6.6.1: Lakes and rivers permanent water area (% of total land area)`,0),0.01)
+
+bounded_data$`6.6.1: Lakes and rivers permanent water area change (%)` <- pmin(pmax(bounded_data$`6.6.1: Lakes and rivers permanent water area change (%)`,quantile(na.omit(bounded_data$`6.6.1: Lakes and rivers permanent water area change (%)`),0.025)),quantile(na.omit(bounded_data$`6.6.1: Lakes and rivers permanent water area change (%)`),0.975))
+
+bounded_data$`6.6.1: Lakes and rivers seasonal water area (% of total land area)` <- pmin(pmax(bounded_data$`6.6.1: Lakes and rivers seasonal water area (% of total land area)`,quantile(na.omit(bounded_data$`6.6.1: Lakes and rivers seasonal water area (% of total land area)`),0.025)),0.015)
+
+bounded_data$`6.6.1: Lakes and rivers seasonal water area change (%)` <- pmin(pmax(bounded_data$`6.6.1: Lakes and rivers seasonal water area change (%)`,quantile(na.omit(bounded_data$`6.6.1: Lakes and rivers seasonal water area change (%)`),0.025)),quantile(na.omit(bounded_data$`6.6.1: Lakes and rivers seasonal water area change (%)`),0.975))
+
+bounded_data$`6.6.1: Reservoir maximum water area (% of total land area)` <- pmin(bounded_data$`6.6.1: Reservoir maximum water area (% of total land area)`
+,quantile(na.omit(bounded_data$`6.6.1: Reservoir maximum water area (% of total land area)`),0.975))
+
+bounded_data$`6.6.1: Reservoir minimum water area (% of total land area)` <- pmin(bounded_data$`6.6.1: Reservoir minimum water area (% of total land area)`
+,quantile(na.omit(bounded_data$`6.6.1: Reservoir minimum water area (% of total land area)`),0.975))
+
+```
+
+```{r}
+############# 7 ###################
+
+bounded_data$`7.1.1: Proportion of population with access to electricity, by urban/rural (%)` <- pmin(pmax(bounded_data$`7.1.1: Proportion of population with access to electricity, by urban/rural (%)`
+,quantile(na.omit(bounded_data$`7.1.1: Proportion of population with access to electricity, by urban/rural (%)`),0.025)),100)
+
+bounded_data$`7.1.2: Proportion of population with primary reliance on clean fuels and technology (%)`<- pmin(pmax(bounded_data$`7.1.2: Proportion of population with primary reliance on clean fuels and technology (%)`
+,quantile(na.omit(bounded_data$`7.1.2: Proportion of population with primary reliance on clean fuels and technology (%)`),0.025)),quantile(na.omit(bounded_data$`7.1.2: Proportion of population with primary reliance on clean fuels and technology (%)`),0.975))
+
+bounded_data$`7.2.1: Renewable energy share in the total final energy consumption (%)` <-pmin(pmax(bounded_data$`7.2.1: Renewable energy share in the total final energy consumption (%)`
+,quantile(na.omit(bounded_data$`7.2.1: Renewable energy share in the total final energy consumption (%)`),0.025)),quantile(na.omit(bounded_data$`7.2.1: Renewable energy share in the total final energy consumption (%)`),0.975))
+
+bounded_data$`7.3.1: Energy intensity level of primary energy (megajoules per constant 2017 purchasing power parity GDP)` <-pmin(pmax(log1p(bounded_data$`7.3.1: Energy intensity level of primary energy (megajoules per constant 2017 purchasing power parity GDP)`),quantile(na.omit(log1p(bounded_data$`7.3.1: Energy intensity level of primary energy (megajoules per constant 2017 purchasing power parity GDP)`)),0.025)),quantile(na.omit(log1p(bounded_data$`7.3.1: Energy intensity level of primary energy (megajoules per constant 2017 purchasing power parity GDP)`)),0.975))
+
+bounded_data$`7.b.1: Installed renewable electricity-generating capacity (watts per capita)` <- pmin(log1p(bounded_data$`7.b.1: Installed renewable electricity-generating capacity (watts per capita)`),quantile(na.omit(log1p(bounded_data$`7.b.1: Installed renewable electricity-generating capacity (watts per capita)`)),0.975)
+)
+
+
+```
+
+```{r}
+############# 8 ###################
+
+bounded_data$`8.1.1: Annual growth rate of real GDP per capita (%)` <- pmin(pmax(bounded_data$`8.1.1: Annual growth rate of real GDP per capita (%)`
+,quantile(na.omit(bounded_data$`8.1.1: Annual growth rate of real GDP per capita (%)`),0.025)),quantile(na.omit(bounded_data$`8.1.1: Annual growth rate of real GDP per capita (%)`),0.975))
+
+bounded_data$`8.10.1: Number of automated teller machines (ATMs) per 100,000 adults` <- pmin(log1p(pmax(bounded_data$`8.10.1: Number of automated teller machines (ATMs) per 100,000 adults`
+,0)),quantile(na.omit(log1p(pmax(bounded_data$`8.10.1: Number of automated teller machines (ATMs) per 100,000 adults`
+,0))),0.975))
+
+bounded_data$`8.10.1: Number of commercial bank branches per 100,000 adults` <- pmin(log1p(pmax(bounded_data$`8.10.1: Number of commercial bank branches per 100,000 adults`
+,0)),quantile(na.omit(log1p(pmax(bounded_data$`8.10.1: Number of commercial bank branches per 100,000 adults`
+,0))),0.975))
+
+
+
+bounded_data$`8.2.1: Annual growth rate of real GDP per employed person (%)` <- pmin(pmax(bounded_data$`8.2.1: Annual growth rate of real GDP per employed person (%)`
+,quantile(na.omit(bounded_data$`8.2.1: Annual growth rate of real GDP per employed person (%)`),0.025)),quantile(na.omit(bounded_data$`8.2.1: Annual growth rate of real GDP per employed person (%)`),0.975))
+
+bounded_data$`8.5.2: Unemployment rate, by sex and age - 13th ICLS (%)` <- pmin(pmax(bounded_data$`8.5.2: Unemployment rate, by sex and age - 13th ICLS (%)`
+,quantile(na.omit(bounded_data$`8.5.2: Unemployment rate, by sex and age - 13th ICLS (%)`),0.025)),quantile(na.omit(bounded_data$`8.5.2: Unemployment rate, by sex and age - 13th ICLS (%)`),0.975))
+
+bounded_data$`8.6.1: Proportion of youth not in education, employment or training, by sex and age - 13th ICLS (%)` <- pmin(pmax(bounded_data$`8.6.1: Proportion of youth not in education, employment or training, by sex and age - 13th ICLS (%)`,quantile(na.omit(bounded_data$`8.6.1: Proportion of youth not in education, employment or training, by sex and age - 13th ICLS (%)`),0.025)),quantile(na.omit(bounded_data$`8.6.1: Proportion of youth not in education, employment or training, by sex and age - 13th ICLS (%)`),0.975))
+```
+
+```{r}
+############# 9 ###################
+
+# Esta igual es descartable, pq no todos los países tienen puerto.
+bounded_data$`9.1.2: Container port traffic, maritime transport (twenty-foot equivalent units - TEUs)` <- pmin(pmax(log1p(pmax(bounded_data$`9.1.2: Container port traffic, maritime transport (twenty-foot equivalent units - TEUs)`
+,8)),quantile(na.omit(log1p(pmax(bounded_data$`9.1.2: Container port traffic, maritime transport (twenty-foot equivalent units - TEUs)`
+,8))),0.025)),quantile(na.omit(log1p(pmax(bounded_data$`9.1.2: Container port traffic, maritime transport (twenty-foot equivalent units - TEUs)`
+,8))),0.975))
+
+bounded_data$`9.2.1: Manufacturing value added (constant 2015 United States dollars) as a proportion of GDP (%)` <- pmin(pmax(bounded_data$`9.2.1: Manufacturing value added (constant 2015 United States dollars) as a proportion of GDP (%)`
+,quantile(na.omit(bounded_data$`9.2.1: Manufacturing value added (constant 2015 United States dollars) as a proportion of GDP (%)`),0.025)),quantile(na.omit(bounded_data$`9.2.1: Manufacturing value added (constant 2015 United States dollars) as a proportion of GDP (%)`),0.975))
+
+bounded_data$`9.2.1: Manufacturing value added (current United States dollars) as a proportion of GDP (%)` <-pmin(pmax(bounded_data$`9.2.1: Manufacturing value added (current United States dollars) as a proportion of GDP (%)`
+,quantile(na.omit(bounded_data$`9.2.1: Manufacturing value added (current United States dollars) as a proportion of GDP (%)`),0.025)),quantile(na.omit(bounded_data$`9.2.1: Manufacturing value added (current United States dollars) as a proportion of GDP (%)`),0.975))
+
+bounded_data$`9.2.2: Manufacturing employment as a proportion of total employment - 13th ICLS (%)` <- pmin(pmax(bounded_data$`9.2.2: Manufacturing employment as a proportion of total employment - 13th ICLS (%)`,quantile(na.omit(bounded_data$`9.2.2: Manufacturing employment as a proportion of total employment - 13th ICLS (%)`),0.025)),quantile(na.omit(bounded_data$`9.2.2: Manufacturing employment as a proportion of total employment - 13th ICLS (%)`),0.975))
+
+########## mmmm, la medida no es ideal, igual hay que eliminarlo.
+bounded_data$`9.4.1: Carbon dioxide emissions from fuel combustion (millions of tonnes)` <- pmin(pmax(log1p(pmax(bounded_data$`9.4.1: Carbon dioxide emissions from fuel combustion (millions of tonnes)`
+,0)),quantile(na.omit(log1p(bounded_data$`9.2.2: Manufacturing employment as a proportion of total employment - 13th ICLS (%)`)),0.025)),quantile(na.omit(log1p(bounded_data$`9.2.2: Manufacturing employment as a proportion of total employment - 13th ICLS (%)`)),0.975))
+
+bounded_data$`9.5.1: Research and development expenditure as a proportion of GDP (%)` <- pmin(pmax(bounded_data$`9.5.1: Research and development expenditure as a proportion of GDP (%)`
+,quantile(na.omit(bounded_data$`9.5.1: Research and development expenditure as a proportion of GDP (%)`),0.025)),quantile(na.omit(bounded_data$`9.5.1: Research and development expenditure as a proportion of GDP (%)`),0.975))
+
+bounded_data$`9.5.2: Researchers (in full-time equivalent) per million inhabitants (per 1,000,000 population)` <- pmin(pmax(log1p(pmax(bounded_data$`9.5.2: Researchers (in full-time equivalent) per million inhabitants (per 1,000,000 population)`
+,0)),quantile(na.omit(log1p(pmax(bounded_data$`9.5.2: Researchers (in full-time equivalent) per million inhabitants (per 1,000,000 population)`
+,0))),0.025)),quantile(na.omit(log1p(pmax(bounded_data$`9.5.2: Researchers (in full-time equivalent) per million inhabitants (per 1,000,000 population)`
+,0))),0.975))
+
+bounded_data$`9.b.1: Proportion of medium and high-tech manufacturing value added in total value added (%)` <- pmin(pmax(bounded_data$`9.b.1: Proportion of medium and high-tech manufacturing value added in total value added (%)`
+,quantile(na.omit(bounded_data$`9.b.1: Proportion of medium and high-tech manufacturing value added in total value added (%)`),0.025)),quantile(na.omit(bounded_data$`9.b.1: Proportion of medium and high-tech manufacturing value added in total value added (%)`),0.975))
+
+bounded_data$`9.c.1: Proportion of population covered by at least a 2G mobile network (%)` <-pmin(pmax(bounded_data$`9.c.1: Proportion of population covered by at least a 2G mobile network (%)`
+,quantile(na.omit(bounded_data$`9.c.1: Proportion of population covered by at least a 2G mobile network (%)`),0.025)),100)
+
+bounded_data$`9.c.1: Proportion of population covered by at least a 3G mobile network (%)` <- pmin(pmax(bounded_data$`9.c.1: Proportion of population covered by at least a 3G mobile network (%)`,0),100)
+
+
+bounded_data$`9.c.1: Proportion of population covered by at least a 4G mobile network (%)` <- pmin(pmax(bounded_data$`9.c.1: Proportion of population covered by at least a 4G mobile network (%)`,0),100)
+```
+
+```{r}
+############# 10 ###################
+
+bounded_data$`10.2.1: Proportion of people living below 50 percent of median income (%)` <- pmin(pmax(bounded_data$`10.2.1: Proportion of people living below 50 percent of median income (%)`,quantile(na.omit(bounded_data$`10.2.1: Proportion of people living below 50 percent of median income (%)`),0.025)),quantile(na.omit(bounded_data$`10.2.1: Proportion of people living below 50 percent of median income (%)`),0.975))
+
+bounded_data$`10.4.1: Labour share of GDP (%)` <- pmin(pmax(bounded_data$`10.4.1: Labour share of GDP (%)`,quantile(na.omit(bounded_data$`10.4.1: Labour share of GDP (%)`),0.025)),quantile(na.omit(bounded_data$`10.4.1: Labour share of GDP (%)`),0.975))
+
+
+### Retocar:
+bounded_data$`10.5.1: Liquid assets to short term liabilities (%)` <- pmin(pmax(log1p(pmax(bounded_data$`10.5.1: Liquid assets to short term liabilities (%)`,0
+)),quantile(na.omit(log1p(pmax(bounded_data$`10.5.1: Liquid assets to short term liabilities (%)`,0
+))),0.025)),quantile(na.omit(log1p(pmax(bounded_data$`10.5.1: Liquid assets to short term liabilities (%)`,0
+))),0.975))
+
+
+### Aquí pasó algo raro
+bounded_data$`10.5.1: Non-performing loans net of provisions to capital (%)`<- pmin(pmax(bounded_data$`10.5.1: Non-performing loans net of provisions to capital (%)`,
+quantile(na.omit(bounded_data$`10.5.1: Non-performing loans net of provisions to capital (%)`),0.025)),quantile(na.omit(bounded_data$`10.5.1: Non-performing loans net of provisions to capital (%)`),0.975))
+
+
+bounded_data$`10.5.1: Non-performing loans to total gross loans (%)` <- pmin(pmax(bounded_data$`10.5.1: Non-performing loans to total gross loans (%)`
+,0),quantile(na.omit(bounded_data$`10.5.1: Non-performing loans to total gross loans (%)`),0.975))
+
+bounded_data$`10.5.1: Regulatory capital to assets (%)` <- pmin(pmax(bounded_data$`10.5.1: Regulatory capital to assets (%)`
+,0),quantile(na.omit(bounded_data$`10.5.1: Regulatory capital to assets (%)`),0.975))
+
+bounded_data$`10.5.1: Regulatory Tier 1 capital to risk-weighted assets (%)` <- pmin(pmax(bounded_data$`10.5.1: Regulatory Tier 1 capital to risk-weighted assets (%)`
+,0),quantile(na.omit(bounded_data$`10.5.1: Regulatory Tier 1 capital to risk-weighted assets (%)`),0.975))
+
+bounded_data$`10.5.1: Return on assets (%)` <- pmin(pmax(bounded_data$`10.5.1: Return on assets (%)`
+,quantile(na.omit(bounded_data$`10.5.1: Return on assets (%)`),0.025)),quantile(na.omit(bounded_data$`10.5.1: Return on assets (%)`),0.975))
+
+bounded_data$`10.5.1: Net open position in foreign exchange to capital (%)` <-pmin(pmax(bounded_data$`10.5.1: Net open position in foreign exchange to capital (%)`,quantile(na.omit(bounded_data$`10.5.1: Net open position in foreign exchange to capital (%)` ),0.025)),quantile(na.omit(bounded_data$`10.5.1: Net open position in foreign exchange to capital (%)` ),0.975)) 
+
+
+bounded_data$`10.6.1: Proportion of members of developing countries in international organizations, by organization (%)` <- pmin(pmax(bounded_data$`10.6.1: Proportion of members of developing countries in international organizations, by organization (%)`
+,quantile(na.omit(bounded_data$`10.6.1: Proportion of members of developing countries in international organizations, by organization (%)` ),0.025)),quantile(na.omit(bounded_data$`10.6.1: Proportion of members of developing countries in international organizations, by organization (%)` ),0.975))
+
+bounded_data$`10.6.1: Proportion of voting rights of developing countries in international organizations, by organization (%)` <- pmin(pmax(bounded_data$`10.6.1: Proportion of voting rights of developing countries in international organizations, by organization (%)`
+,quantile(na.omit(bounded_data$`10.6.1: Proportion of voting rights of developing countries in international organizations, by organization (%)`),0.025)),quantile(na.omit(bounded_data$`10.6.1: Proportion of voting rights of developing countries in international organizations, by organization (%)`),0.975))
+
+bounded_data$`10.7.4: Number of refugees per 100,000 population, by country of origin (per 100,000 population)` <- pmin(log1p(pmax(bounded_data$`10.7.4: Number of refugees per 100,000 population, by country of origin (per 100,000 population)`,0)),quantile(na.omit(log1p(bounded_data$`10.7.4: Number of refugees per 100,000 population, by country of origin (per 100,000 population)`)),0.975))
+
+bounded_data$`10.a.1: Proportion of tariff lines applied to imports with zero-tariff (%)` <- pmin(pmax(bounded_data$`10.a.1: Proportion of tariff lines applied to imports with zero-tariff (%)`,quantile(na.omit(bounded_data$`10.a.1: Proportion of tariff lines applied to imports with zero-tariff (%)`),0.025)),quantile(na.omit(bounded_data$`10.a.1: Proportion of tariff lines applied to imports with zero-tariff (%)`),0.975))
+```
+
+
+```{r}
+############# 11 ###################
+
+bounded_data$`11.5.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)` <- pmin(log1p(pmax(bounded_data$`11.5.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`,0)),quantile(na.omit(log1p(pmax(bounded_data$`11.5.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`,0))),0.975))
+
+bounded_data$`11.5.1: Number of directly affected persons attributed to disasters per 100,000 population (number)` <- pmin(log1p(pmax(bounded_data$`11.5.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`,0)),quantile(na.omit(log1p(pmax(bounded_data$`11.5.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`,0))),0.975))
+
+bounded_data$`11.6.2: Annual mean levels of fine particulate matter (population-weighted), by location (micrograms per cubic meter)` <- pmin(pmax(bounded_data$`11.6.2: Annual mean levels of fine particulate matter (population-weighted), by location (micrograms per cubic meter)`,quantile(na.omit(bounded_data$`11.6.2: Annual mean levels of fine particulate matter (population-weighted), by location (micrograms per cubic meter)`),0.025)),quantile(na.omit(bounded_data$`11.6.2: Annual mean levels of fine particulate matter (population-weighted), by location (micrograms per cubic meter)`),0.975))
+
+
+```
+
+```{r}
+############# 12 ###################
+
+bounded_data$`12.a.1: Installed renewable electricity-generating capacity (watts per capita)` <- pmin(log1p(bounded_data$`12.a.1: Installed renewable electricity-generating capacity (watts per capita)`), quantile(na.omit(log1p(bounded_data$`12.a.1: Installed renewable electricity-generating capacity (watts per capita)` )),0.975))
+
+bounded_data$`12.c.1: Fossil-fuel subsidies (consumption and production) (billions of nominal United States dollars)` <- log1p(pmin(pmax(bounded_data$`12.c.1: Fossil-fuel subsidies (consumption and production) (billions of nominal United States dollars)`,0),37.05858))
+
+bounded_data$`12.c.1: Fossil-fuel subsidies (consumption and production) as a proportion of total GDP (%)` <- pmin(pmax(bounded_data$`12.c.1: Fossil-fuel subsidies (consumption and production) as a proportion of total GDP (%)`,0),quantile(na.omit(bounded_data$`12.c.1: Fossil-fuel subsidies (consumption and production) as a proportion of total GDP (%)`),0.975))
+```
+
+```{r}
+############# 13 ###################
+
+bounded_data$`13.1.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)` <- pmin(log1p(pmax(bounded_data$`13.1.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`,0)),quantile(na.omit(log1p(pmax(bounded_data$`13.1.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`,0))),0.975))
+
+bounded_data$`13.1.1: Number of directly affected persons attributed to disasters per 100,000 population (number)` <- pmin(log1p(pmax(bounded_data$`13.1.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`,0)),quantile(na.omit(log1p(pmax(bounded_data$`13.1.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`,0))),0.975))
+
+```
+
+```{r}
+############# 14 ###################
+
+bounded_data$`14.1.1: Chlorophyll-a deviations, remote sensing (%)` <- pmin(pmax(bounded_data$`14.1.1: Chlorophyll-a deviations, remote sensing (%)`,quantile(na.omit(bounded_data$`14.1.1: Chlorophyll-a deviations, remote sensing (%)` ),0.025)),quantile(na.omit(bounded_data$`14.1.1: Chlorophyll-a deviations, remote sensing (%)` ),0.975))
+
+bounded_data$`14.5.1: Average proportion of Marine Key Biodiversity Areas (KBAs) covered by protected areas (%)` <- pmin(pmax(bounded_data$`14.5.1: Average proportion of Marine Key Biodiversity Areas (KBAs) covered by protected areas (%)`,0),quantile(na.omit(bounded_data$`14.5.1: Average proportion of Marine Key Biodiversity Areas (KBAs) covered by protected areas (%)`),0.975))
+
+```
+
+```{r}
+############# 15 ###################
+
+bounded_data$`15.1.2: Average proportion of Freshwater Key Biodiversity Areas (KBAs) covered by protected areas (%)` <- pmin(pmax(bounded_data$`15.1.2: Average proportion of Freshwater Key Biodiversity Areas (KBAs) covered by protected areas (%)`
+,0),quantile(na.omit(bounded_data$`15.1.2: Average proportion of Freshwater Key Biodiversity Areas (KBAs) covered by protected areas (%)`),0.975))
+
+bounded_data$`15.1.2: Average proportion of Terrestrial Key Biodiversity Areas (KBAs) covered by protected areas (%)` <- pmin(pmax(bounded_data$`15.1.2: Average proportion of Terrestrial Key Biodiversity Areas (KBAs) covered by protected areas (%)`,0),quantile(na.omit(bounded_data$`15.1.2: Average proportion of Terrestrial Key Biodiversity Areas (KBAs) covered by protected areas (%)`),0.975))
+
+bounded_data$`15.4.1: Average proportion of Mountain Key Biodiversity Areas (KBAs) covered by protected areas (%)` <- pmin(pmax(bounded_data$`15.4.1: Average proportion of Mountain Key Biodiversity Areas (KBAs) covered by protected areas (%)`,0),quantile(na.omit(bounded_data$`15.4.1: Average proportion of Mountain Key Biodiversity Areas (KBAs) covered by protected areas (%)`),0.975))
+
+bounded_data$`15.5.1: Red List Index`  <- pmin(pmax(bounded_data$`15.5.1: Red List Index` ,quantile(na.omit(bounded_data$`15.5.1: Red List Index`),0.025)
+),quantile(na.omit(bounded_data$`15.5.1: Red List Index`),0.975))
+
+
+```
+
+```{r}
+############# 16 ###################
+
+bounded_data$`16.1.1: Number of victims of intentional homicide per 100,000 population, by sex (victims per 100,000 population)` <- pmin(pmax(log1p(pmax(bounded_data$`16.1.1: Number of victims of intentional homicide per 100,000 population, by sex (victims per 100,000 population)`,0))
+,quantile(na.omit(log1p(pmax(bounded_data$`16.1.1: Number of victims of intentional homicide per 100,000 population, by sex (victims per 100,000 population)`,0))),0.025)),quantile(na.omit(log1p(pmax(bounded_data$`16.1.1: Number of victims of intentional homicide per 100,000 population, by sex (victims per 100,000 population)`,0))),0.975))
+
+bounded_data$`16.3.2: Unsentenced detainees as a proportion of overall prison population (%)` <- pmin(pmax(bounded_data$`16.3.2: Unsentenced detainees as a proportion of overall prison population (%)`
+,quantile(na.omit(bounded_data$`16.3.2: Unsentenced detainees as a proportion of overall prison population (%)`),0.025)),quantile(na.omit(bounded_data$`16.3.2: Unsentenced detainees as a proportion of overall prison population (%)`),0.975))
+
+bounded_data$`16.6.1: Primary government expenditures as a proportion of original approved budget (%)` <- pmin(pmax(bounded_data$`16.6.1: Primary government expenditures as a proportion of original approved budget (%)`
+,quantile(na.omit(bounded_data$`16.6.1: Primary government expenditures as a proportion of original approved budget (%)`),0.025)),quantile(na.omit(bounded_data$`16.6.1: Primary government expenditures as a proportion of original approved budget (%)`),0.975))
+
+bounded_data$`16.8.1: Proportion of members of developing countries in international organizations, by organization (%)` <- pmin(pmax(bounded_data$`16.8.1: Proportion of members of developing countries in international organizations, by organization (%)`
+,quantile(na.omit(bounded_data$`16.8.1: Proportion of members of developing countries in international organizations, by organization (%)`),0.025)),quantile(na.omit(bounded_data$`16.8.1: Proportion of members of developing countries in international organizations, by organization (%)`),0.975))
+
+bounded_data$`16.8.1: Proportion of voting rights of developing countries in international organizations, by organization (%)` <- pmin(pmax(bounded_data$`16.8.1: Proportion of voting rights of developing countries in international organizations, by organization (%)`
+,quantile(na.omit(bounded_data$`16.8.1: Proportion of voting rights of developing countries in international organizations, by organization (%)`),0.025)),quantile(na.omit(bounded_data$`16.8.1: Proportion of voting rights of developing countries in international organizations, by organization (%)`),0.975))
+
+
+```
+
+```{r}
+############# 17 ###################
+
+bounded_data$`17.1.1: Total government revenue (budgetary central government) as a proportion of GDP (%)` <- pmin(pmax(bounded_data$`17.1.1: Total government revenue (budgetary central government) as a proportion of GDP (%)`
+,quantile(na.omit(bounded_data$`17.1.1: Total government revenue (budgetary central government) as a proportion of GDP (%)`),0.025)),quantile(na.omit(bounded_data$`17.1.1: Total government revenue (budgetary central government) as a proportion of GDP (%)`),0.975))
+
+bounded_data$`17.1.2: Proportion of domestic budget funded by domestic taxes (% of GDP)` <- pmin(pmax(bounded_data$`17.1.2: Proportion of domestic budget funded by domestic taxes (% of GDP)`
+,quantile(na.omit(bounded_data$`17.1.2: Proportion of domestic budget funded by domestic taxes (% of GDP)`),0.025)),quantile(na.omit(bounded_data$`17.1.2: Proportion of domestic budget funded by domestic taxes (% of GDP)`),0.975))
+
+bounded_data$`17.12.1: Average tariff applied by developed countries, most-favored nation status, by type of product (%)` <- pmin(pmax(bounded_data$`17.12.1: Average tariff applied by developed countries, most-favored nation status, by type of product (%)`
+,quantile(na.omit(bounded_data$`17.12.1: Average tariff applied by developed countries, most-favored nation status, by type of product (%)`),0.025)),quantile(na.omit(bounded_data$`17.12.1: Average tariff applied by developed countries, most-favored nation status, by type of product (%)`),0.975))
+
+bounded_data$`17.12.1: Average tariff applied by developed countries, preferential status, by type of product (%)` <- pmin(pmax(bounded_data$`17.12.1: Average tariff applied by developed countries, preferential status, by type of product (%)`
+,quantile(na.omit(bounded_data$`17.12.1: Average tariff applied by developed countries, preferential status, by type of product (%)`),0.025)),quantile(na.omit(bounded_data$`17.12.1: Average tariff applied by developed countries, preferential status, by type of product (%)`),0.975))
+
+bounded_data$`17.13.1: Annual broad money growth (%)` <- pmin(pmax(bounded_data$`17.13.1: Annual broad money growth (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Annual broad money growth (%)`),0.025)),quantile(na.omit(bounded_data$`17.13.1: Annual broad money growth (%)`),0.975))
+
+bounded_data$`17.13.1: Annual GDP growth (%)` <- pmin(pmax(bounded_data$`17.13.1: Annual GDP growth (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Annual GDP growth (%)`),0.025)),quantile(na.omit(bounded_data$`17.13.1: Annual GDP growth (%)`),0.975))
+
+bounded_data$`17.13.1: Annual growth of exports of goods and services (%)` <- pmin(pmax(bounded_data$`17.13.1: Annual growth of exports of goods and services (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Annual growth of exports of goods and services (%)`),0.025)),quantile(na.omit(bounded_data$`17.13.1: Annual growth of exports of goods and services (%)`),0.975))
+
+bounded_data$`17.13.1: Annual growth of households and NPISHs final consumption expenditure (%)` <- pmin(pmax(bounded_data$`17.13.1: Annual growth of households and NPISHs final consumption expenditure (%)`,quantile(na.omit(bounded_data$`17.13.1: Annual growth of households and NPISHs final consumption expenditure (%)`),0.025)
+),quantile(na.omit(bounded_data$`17.13.1: Annual growth of households and NPISHs final consumption expenditure (%)`),0.975))
+
+bounded_data$`17.13.1: Annual growth of imports of goods and services (%)` <- pmin(pmax(bounded_data$`17.13.1: Annual growth of imports of goods and services (%)`,
+-50),60)
+
+bounded_data$`17.13.1: Annual growth of the general government final consumption expenditure (%)` <- pmin(pmax(bounded_data$`17.13.1: Annual growth of the general government final consumption expenditure (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Annual growth of the general government final consumption expenditure (%)`),0.025)),quantile(na.omit(bounded_data$`17.13.1: Annual growth of the general government final consumption expenditure (%)`),0.975))
+
+bounded_data$`17.13.1: Annual growth of the gross capital formation (%)` <- pmin(pmax(bounded_data$`17.13.1: Annual growth of the gross capital formation (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Annual growth of the gross capital formation (%)`),0.025)),quantile(na.omit(bounded_data$`17.13.1: Annual growth of the gross capital formation (%)`),0.975))
+
+bounded_data$`17.13.1: Annual inflation, consumer prices (%)` <- pmin(pmax(bounded_data$`17.13.1: Annual inflation, consumer prices (%)`
+,-5),30)
+
+bounded_data$`17.13.1: Cash surplus/deficit as a proportion of GDP (%)`<- pmin(pmax(bounded_data$`17.13.1: Cash surplus/deficit as a proportion of GDP (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Cash surplus/deficit as a proportion of GDP (%)`),0.025)), quantile(na.omit(bounded_data$`17.13.1: Cash surplus/deficit as a proportion of GDP (%)`),0.975))
+
+bounded_data$`17.13.1: Bank capital to assets ratio (%)` <- pmin(pmax(bounded_data$`17.13.1: Bank capital to assets ratio (%)`
+,0),quantile(na.omit(bounded_data$`17.13.1: Bank capital to assets ratio (%)` ),0.975))
+
+bounded_data$`17.13.1: Broad money to total reserves ratio` <- log1p(pmin(pmax(bounded_data$`17.13.1: Broad money to total reserves ratio`
+,quantile(na.omit(bounded_data$`17.13.1: Tax revenue as a proportion of GDP (%)`),0.025)), 37.83736))
+
+
+bounded_data$`17.13.1: Tax revenue as a proportion of GDP (%)` <- pmin(pmax(bounded_data$`17.13.1: Tax revenue as a proportion of GDP (%)`
+,0),quantile(na.omit(bounded_data$`17.13.1: Tax revenue as a proportion of GDP (%)`),0.975))
+
+bounded_data$`17.13.1: Current account balance as a proportion of GDP (%)` <- pmin(pmax(bounded_data$`17.13.1: Current account balance as a proportion of GDP (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Current account balance as a proportion of GDP (%)`),0.025)),quantile(na.omit(bounded_data$`17.13.1: Current account balance as a proportion of GDP (%)`),0.975))
+
+bounded_data$`17.13.1: DEC alternative conversion factor (in local currency unit per United States dollar)` <- pmin(log1p(pmax(bounded_data$`17.13.1: DEC alternative conversion factor (in local currency unit per United States dollar)`
+,0)),quantile(na.omit(log1p(bounded_data$`17.13.1: DEC alternative conversion factor (in local currency unit per United States dollar)`)),0.975))
+
+bounded_data$`17.13.1: External debt stocks as a proportion of GNI (%)` <- pmin(pmax(bounded_data$`17.13.1: External debt stocks as a proportion of GNI (%)`
+,quantile(na.omit(bounded_data$`17.13.1: External debt stocks as a proportion of GNI (%)`),0.025)
+ ),quantile(na.omit(bounded_data$`17.13.1: External debt stocks as a proportion of GNI (%)`),0.975))
+
+bounded_data$`17.13.1: Foreign direct investment, net inflows, as a proportion of GDP (%)` <- pmin(pmax(bounded_data$`17.13.1: Foreign direct investment, net inflows, as a proportion of GDP (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Foreign direct investment, net inflows, as a proportion of GDP (%)`),0.025)), quantile(na.omit(bounded_data$`17.13.1: Foreign direct investment, net inflows, as a proportion of GDP (%)`),0.975))
+
+bounded_data$`17.13.1: Merchandise trade as a proportion of GDP (%)` <- pmin(pmax(bounded_data$`17.13.1: Merchandise trade as a proportion of GDP (%)`
+,quantile(na.omit(bounded_data$`17.13.1: Merchandise trade as a proportion of GDP (%)`),0.025)),quantile(na.omit(bounded_data$`17.13.1: Merchandise trade as a proportion of GDP (%)`),0.975))
+
+bounded_data$`17.13.1: Total reserves in months of imports (ratio)` <- pmin(pmax(bounded_data$`17.13.1: Total reserves in months of imports (ratio)`
+,quantile(na.omit(bounded_data$`17.13.1: Total reserves in months of imports (ratio)`),0.025)),quantile(na.omit(bounded_data$`17.13.1: Total reserves in months of imports (ratio)`),0.975))
+
+bounded_data$`17.3.2: Volume of remittances (in United States dollars) as a proportion of total GDP (%)` <-pmin(pmax(bounded_data$`17.3.2: Volume of remittances (in United States dollars) as a proportion of total GDP (%)` 
+,0),quantile(na.omit(bounded_data$`17.3.2: Volume of remittances (in United States dollars) as a proportion of total GDP (%)`),0.975))
+
+bounded_data$`17.4.1: Debt service as a proportion of exports of goods and services (%)` <- pmin(pmax(bounded_data$`17.4.1: Debt service as a proportion of exports of goods and services (%)`
+,quantile(na.omit(bounded_data$`17.4.1: Debt service as a proportion of exports of goods and services (%)` ),0.025)),quantile(na.omit(bounded_data$`17.4.1: Debt service as a proportion of exports of goods and services (%)` ),0.975))
+
+bounded_data$`17.6.1: Fixed broadband subscriptions per 100 inhabitants, by speed (per 100 inhabitants)`<- pmin(log1p(pmin(pmax(bounded_data$`17.6.1: Fixed broadband subscriptions per 100 inhabitants, by speed (per 100 inhabitants)`,0)
+,quantile(na.omit(log1p(pmax(bounded_data$`17.6.1: Fixed broadband subscriptions per 100 inhabitants, by speed (per 100 inhabitants)`,0))),0.975))))
+
+bounded_data$`17.8.1: Proportion of individuals using the Internet (%)`<- pmin(pmax(bounded_data$`17.8.1: Proportion of individuals using the Internet (%)`
+,quantile(na.omit(bounded_data$`17.8.1: Proportion of individuals using the Internet (%)`),0.025)),quantile(na.omit(bounded_data$`17.8.1: Proportion of individuals using the Internet (%)`),0.975))
+
+
+#bounded_data$`17.11.1: Developing countries’ and least developed countries’ share of global merchandise exports (%)`
+
+#bounded_data$`17.11.1: Developing countries’ and least developed countries’ share of global merchandise imports (%)`
+```
+
+VISUALIZE BOUNDED DATA
+
+```{r}
+datos_indicadores <- bounded_data[, -c(1,2)]
+
+# Crear histogramas para cada columna
+par(mfrow = c(3, 2))  # Configurar la cuadrícula para mostrar los histogramas en 2 filas y 4 columnas
+for (i in 1:ncol(datos_indicadores)) {
+  hist(datos_indicadores[, i], main = colnames(datos_indicadores)[i], xlab = "Valor", ylab = "Frecuencia")
+}
+par(mfrow = c(1,1))
+```
+
+# Normalizing the data:
+
+
+In order to assign values between 0 and 100 to our data, we need to determine whether a higher value is considered good or bad for each indicator. To do this, we will focus on the least developed countries and compare the mean values of the indicators for these countries. By examining whether the mean values are above or below the benchmarks set by these least developed countries, we can establish whether higher values indicate better performance or vice versa. This analysis will help us determine the appropriate scaling of the data between 0 and 100.
+
+We first need to calculate a vector indicating if having a high value is good (TRUE) or bad (FALSE). 
+
+```{r, warning=FALSE}
+########## Calculating the mean for each year ##############
+
+data_sdg2 <- bounded_data
+means_years <- aggregate(x = data_sdg2[, -2], by = list(data_sdg2[, 1]), FUN = "mean")[,-2]
+
+media_paises <- colMeans(means_years[, -1], na.rm = TRUE)
+media_paises <- as.data.frame(media_paises)
+
+means_years_menos_desarrollados <- means_years[means_years$Group.1%in% c('Afghanistan','Angola','Bangladesh','Mauritania','Timor-Leste','Papua New Guinea',"Lao People's Democratic Republic",'Senegal','Kenya','Angola','Haiti','Chad',"Central African Republic","Burkina Faso",'Namibia','Cambodia', 'Panama','Algeria'),]
+
+media_paises_md <- colMeans(means_years_menos_desarrollados[, -1], na.rm = TRUE)
+media_paises_md <- as.data.frame(media_paises_md)
+
+positivo <- media_paises > media_paises_md
+positivo <- unname(positivo)
+```
+
+
+```{r}
+
+positivo <- c(T,T,F,T,T,F,F,T,F,T,F,F,F,
+              F,F,T,F,F,F,F,T,F,F,F,F,F,
+              F,T,T,T,T,T,T,T,T,T,F,F,T,
+              T,F,T,F,F,T,T,T,F,T,T,T,T,
+              F,F,T,F,T,T,F,F,F,T,T,T,F,
+              T,T,T,T,T,T,T,F,T,F,F,F,F,
+              T,T,T,T,T,F,T,F,F,F,T,F,F,
+              F,F,F,T,T,T,T,T,F,F,T,T,T,
+              T,F,F,F,F,F,F,F,T,F,F,F,F,
+              F,F,F,F,F,F,F,T,T,F,T,F,F,
+              F,F,T,T)
+
+positivo <- c(T,T,F,T,T,F,F,
+              F,F,F,F,F,F,F,F,T,F,F,
+              F,F,T,F,F,F,F,F,
+              F,T,T,T,T,T,T,T,T,T,T,F,T,
+              T,F,T,F,T,T,T,F,F,T,T,T,T,
+              T,F,T,T,T,T,F,F,F,T,F,F,F,
+              T,T,T,T,T,T,T,F,T,F,F,F,T,
+              F,F,F,F,F,T,T,F,F,F,T,F,F,
+              F,F,F,T,T,T,T,T,F,F,T,F,F,
+              T,T,F,F,F,F,F,F,T,F,F,F,F,
+              F,F,F,F,T,F,F,T,T,F,T,F,F,
+              F,F,T,T)
+```
+Now we can proceed with scaling the data, taking into account the sign vector.
+
+```{r}
+
+datos_estandar <- cbind(data_sdg2[c(1,2)],as.data.frame(lapply(data_sdg2[-c(1,2)],
+                                       function(x) 100*(x-min(na.omit(x)))/(max(na.omit(x))-min(na.omit(x))))))
+datos_estandar <- lapply(datos_estandar, function(x) replace(x, is.nan(x), NA))
+datos_estandar <- as.data.frame(datos_estandar)
+colnames(datos_estandar) <- names(data_sdg2)
+#View(datos_estandar)
+
+datos_normalizados <- datos_estandar
+for(i in 1:length(positivo)){
+
+  if(!positivo[i]){
+    datos_normalizados[,(i+2)]<-100-datos_normalizados[,(i+2)]
+  }
+}
+#View(datos_normalizados)
+```
+
+# Filling the missing data: countries indicators with low or null data
+
+We will now proceed to fill the remaining missing data. To do this, we will first compute a matrix containing the distance of the data from one country to another. But before that, we need to identify the indicators per country that still have missing data:
+
+```{r}
+coordenadas <- which(tablas > 0 & class(tablas)!="character", arr.ind = TRUE)
+#head(coordenadas)
+coordenadas80 <- coordenadas[-(1:(dim(tablas)[1])),]
+#head(coordenadas80)
+dimtab <- dim(tabla_porcentajes)-c(0,2)
+# Porcentaje de datos que tendré que rellenar comparando con paises cercanos.
+100*dim(coordenadas80)[1]/(dimtab[1]*dimtab[2])
+
+sin_datos <- data.frame(
+  Pais = tabla_porcentajes[,1][coordenadas80[, 1]],
+  Indicador = colnames(tabla_porcentajes)[coordenadas80[, 2]]
+)
+
+parejas <- lapply(1:nrow(sin_datos), function(i) c(sin_datos$Pais[i], sin_datos$Indicador[i]))
+```
+
+Let's demonstrate how to calculate the distance between countries using Spain as a specific example. We will illustrate the process of calculating the distance by considering the indicators available for both Spain and other countries.
+
+```{r}
+############# Ejemplo distancias a España ##################
+
+diferencia_españa_francia <- datos_normalizados[datos_normalizados$GeoAreaName == 'Spain', -c(1, 2)] - datos_normalizados[datos_normalizados$GeoAreaName == 'France', -c(1, 2)]
+distancias_españa_francia <- apply(diferencia_españa_francia, 2, function(col) norm(col, type = "2"))
+sum(na.omit(distancias_españa_francia)) / length(na.omit(distancias_españa_francia))
+
+diferencia_españa_mongolia <- datos_normalizados[datos_normalizados$GeoAreaName == 'Spain', -c(1, 2)] - datos_normalizados[datos_normalizados$GeoAreaName == 'Mongolia', -c(1, 2)]
+distancias_españa_mongolia <- apply(diferencia_españa_mongolia, 2, function(col) norm(col, type = "2"))
+sum(na.omit(distancias_españa_mongolia)) / length(na.omit(distancias_españa_mongolia))
+
+```
+We calculate the distance matrix, which represents the distance between all pairs of countries in the dataset. This matrix provides a comprehensive overview of the distances among all countries.
+
+```{r}
+calcular_matriz_distancias <- function(datos_normalizados) {
+  # Lista de países
+  paises <- unique(datos_normalizados$GeoAreaName)
+  
+  # Crear matriz vacía
+  matriz_distancias <- matrix(NA, nrow = length(paises), ncol = length(paises))
+  rownames(matriz_distancias) <- paises
+  colnames(matriz_distancias) <- paises
+  
+  # Calcular distancia entre cada par de países
+  for (i in 1:length(paises)) {
+    #print(i)
+    for (j in i:length(paises)) {
+      if (i == j) {
+        matriz_distancias[i, j] <- 0
+      } else {
+        diferencia <- datos_normalizados[datos_normalizados$GeoAreaName == paises[i], -c(1, 2)] - 
+          datos_normalizados[datos_normalizados$GeoAreaName == paises[j], -c(1, 2)]
+        distancias <- apply(diferencia, 2, function(col) norm(col, type = "2"))
+        matriz_distancias[i, j] <- sum(na.omit(distancias)) / length(na.omit(distancias))
+        matriz_distancias[j, i] <- sum(na.omit(distancias)) / length(na.omit(distancias))
+      }
+    }
+  }
+
+  return(matriz_distancias)
+}
+
+matriz_distancias <- calcular_matriz_distancias(datos_normalizados)
+#View(matriz_distancias)
+```
+
+
+Let's create a function that will help us find the closest countries to each country in the dataset. This function will allow us to identify the countries that are most similar to a given country based on the distance matrix calculated above.
+
+```{r}
+paises_mas_cercanos <- function(matriz_distancias, n = 15) {
+  paises <- rownames(matriz_distancias)
+  
+  paises_cercanos <- list()
+  
+  # Encontrar los países más cercanos para cada país
+  for (i in 1:length(paises)) {
+    distancias <- matriz_distancias[i, ]
+    paises_cercanos[[paises[i]]] <- names(distancias[distancias > 0 & !is.na(distancias)])[order(distancias[distancias > 0 & !is.na(distancias)])][1:n]
+  }
+
+  return(paises_cercanos)
+}
+
+paises_cercanos <- paises_mas_cercanos(matriz_distancias, n = 5)
+
+```
+ 
+We will now display a few examples to verify the validity of the calculated results.
+
+```{r}
+paises_cercanos$Spain
+paises_cercanos$Sweden
+paises_cercanos$Kuwait
+paises_cercanos$Peru
+paises_cercanos$Zambia
+```
+
+The examples demonstrate the effectiveness of the distance matrix, as the associated countries for each country are highly similar, considering economic, social, and geographical characteristics.
+
+# Distance matrix for indicators:
+
+```{r}
+calcular_matriz_distancias_indicadores <- function(datos_normalizados) {
+  # Lista de indicadores
+  indicadores <- colnames(datos_normalizados)[-c(1, 2)]
+  
+  # Crear matriz vacía
+  matriz_distancias <- matrix(NA, nrow = length(indicadores), ncol = length(indicadores))
+  rownames(matriz_distancias) <- indicadores
+  colnames(matriz_distancias) <- indicadores
+  
+  # Calcular distancia entre cada par de indicadores
+  for (i in 1:length(indicadores)) {
+    for (j in 1:length(indicadores)) {
+      if (i == j) {
+        matriz_distancias[i, j] <- 0
+      } else {
+        diferencia <- datos_normalizados[, indicadores[i]] - datos_normalizados[, indicadores[j]]
+        distancia <- sqrt(sum(na.omit(diferencia^2))/length(na.omit(diferencia)))
+        matriz_distancias[i, j] <- distancia
+        matriz_distancias[j, i] <- distancia
+      }
+    }
+  }
+
+  return(matriz_distancias)
+}
+
+matriz_distancias_indicadores <- calcular_matriz_distancias_indicadores(datos_normalizados)
+
+```
+
+We will now calculate the closest neighbours for each indicator
+
+```{r}
+indicadores_mas_cercanos <- function(matriz_distancias_cercanas, n = 15) {
+  indicadores <- rownames(matriz_distancias_cercanas)
+  
+  indicadores_cercanos <- list()
+  
+  # Encontrar los países más cercanos para cada país
+  for (i in 1:length(indicadores)) {
+    distancias <- matriz_distancias_cercanas[i, ]
+    indicadores_cercanos[[indicadores[i]]] <- names(distancias[distancias > 0 & !is.na(distancias)])[order(distancias[distancias > 0 & !is.na(distancias)])][1:n]
+  }
+
+  return(indicadores_cercanos)
+}
+
+indicadores_cercanos <- indicadores_mas_cercanos(matriz_distancias_indicadores, n = 100)
+```
+
+We will now proceed to calculate the indicators for countries with low or null data. To do this, we will calculate the mean of the three countries that are most similar and have available data.
+
+# Amelia
+
+Basic ideas behind Amelia: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4740012/
+
+Bootstrap-based EM algorithm is employed to impute missing values. The algorithm draws m (the number of imputation dataset) samples of size n (the size of original dataset) from original dataset. Point estimates of mean and variance (both are vectors) are performed in each sample by using EM method. Remember there are m sets of estimates. Then each set of estimates is used to impute the missing observations from original dataset. The result is m sets of imputed data that can be used for subsequent analyses (Figure 1). Detailed description of bootstrap-based EM algorithm may be too complex for non-statistician readers and readers can refer to the chapter (4) if they need more detailed descriptions.
+
+
+```{r}
+####### combined_data <- complete(amelia_object, imputation = 1)
+######Esto de arriba puede ser útil
+library(doParallel)
+
+datos_amelia <-datos_normalizados
+cl <- makeCluster(4)
+registerDoParallel(cl)
+amelia_output <- amelia(datos_amelia, m = 5, ts = "TimePeriod", cs = "GeoAreaName", parallel = "multicore")
+stopCluster(cl)
+
+
+
+na <- rep(NA,23)
+
+for (pareja in parejas) {
+  datos_amelia[datos_amelia$GeoAreaName==pareja[1],pareja[2]] <- na
+}
+
+subconjunto11 <- datos_amelia[1:1012,c(1,2,3:35)]
+
+subconjunto12 <- datos_amelia[1:1012,c(1,2,36:68)]
+
+subconjunto13 <- datos_amelia[1:1012,c(1,2,69:102)]
+
+subconjunto14 <- datos_amelia[1:1012,c(1,2,103:136)]
+
+
+subconjunto21 <- datos_amelia[1013:2024,c(1,2,3:35)]
+
+subconjunto22 <- datos_amelia[1013:2024,c(1,2,36:68)]
+
+subconjunto23 <- datos_amelia[1013:2024,c(1,2,69:102)]
+
+subconjunto24 <- datos_amelia[1013:2024,c(1,2,103:136)]
+
+
+subconjunto31 <- datos_amelia[2025:3036,c(1,2,3:35)]
+
+subconjunto32 <- datos_amelia[2025:3036,c(1,2,36:68)]
+
+subconjunto33 <- datos_amelia[2025:3036,c(1,2,69:102)]
+
+subconjunto34 <- datos_amelia[2025:3036,c(1,2,103:136)]
+
+
+
+subconjunto41 <- datos_amelia[3037:4071,c(1,2,3:35)]
+
+subconjunto42 <- datos_amelia[3037:4071,c(1,2,36:68)]
+
+subconjunto43 <- datos_amelia[3037:4071,c(1,2,69:102)]
+
+subconjunto44 <- datos_amelia[3037:4071,c(1,2,103:136)]
+
+
+
+
+#subconjunto <- datos_amelia
+
+cl1 <- makeCluster(6)
+cl2 <- makeCluster(6)
+cl3 <- makeCluster(6)
+cl4 <- makeCluster(6)
+
+registerDoParallel(cl1)
+registerDoParallel(cl2)
+registerDoParallel(cl3)
+registerDoParallel(cl4)
+
+amelia_sdg11 <- amelia(subconjunto11, m = 5, ts = "TimePeriod", cs = "GeoAreaName",parallel = 'multicore')
+imputados11 <- amelia_sdg11$imputations
+subconjunto_amelia11 <- subconjunto11
+for(i in 1:(dim(subconjunto_amelia11)[1])){
+  for(j in 3:(dim(subconjunto_amelia11)[2])){
+    subconjunto_amelia11[i,j] <- (imputados11$imp1[i,j]+imputados11$imp2[i,j]+
+                           imputados11$imp3[i,j]+ imputados11$imp4[i,j]+ 
+                           imputados11$imp5[i,j])/5
+  }
+}
+
+amelia_sdg12 <- amelia(subconjunto12, m = 5, ts = "TimePeriod", cs = "GeoAreaName",parallel = 'multicore')
+imputados12 <- amelia_sdg12$imputations
+subconjunto_amelia12 <- subconjunto12
+
+for(i in 1:(dim(subconjunto_amelia12)[1])){
+  for(j in 3:(dim(subconjunto_amelia12)[2])){
+    subconjunto_amelia12[i,j] <- (imputados12$imp1[i,j]+imputados12$imp2[i,j]+
+                           imputados12$imp3[i,j]+ imputados12$imp4[i,j]+ 
+                           imputados12$imp5[i,j])/5
+  }
+}
+
+amelia_sdg13 <- amelia(subconjunto13, m = 5, ts = "TimePeriod", cs = "GeoAreaName",parallel = 'multicore')
+imputados13 <- amelia_sdg13$imputations
+subconjunto_amelia13 <- subconjunto13
+
+for(i in 1:(dim(subconjunto_amelia13)[1])){
+  for(j in 3:(dim(subconjunto_amelia13)[2])){
+    subconjunto_amelia13[i,j] <- (imputados13$imp1[i,j]+imputados13$imp2[i,j]+
+                           imputados13$imp3[i,j]+ imputados13$imp4[i,j]+ 
+                           imputados13$imp5[i,j])/5
+  }
+}
+
+amelia_sdg14 <- amelia(subconjunto14, m = 5, ts = "TimePeriod", cs = "GeoAreaName",parallel = 'multicore')
+imputados14 <- amelia_sdg14$imputations
+subconjunto_amelia14 <- subconjunto14
+
+for(i in 1:(dim(subconjunto_amelia14)[1])){
+  for(j in 3:(dim(subconjunto_amelia14)[2])){
+    subconjunto_amelia14[i,j] <- (imputados13$imp1[i,j]+imputados13$imp2[i,j]+
+                           imputados14$imp3[i,j]+ imputados14$imp4[i,j]+ 
+                           imputados14$imp5[i,j])/5
+  }
+}
+
+stopCluster(cl1)
+stopCluster(cl2)
+stopCluster(cl3)
+stopCluster(cl4)
+
+
+
+amelia_sdg21 <- amelia(subconjunto21, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados21 <- amelia_sdg21$imputations
+subconjunto_amelia21 <- subconjunto21
+
+for(i in 1:(dim(subconjunto_amelia21)[1])){
+  for(j in 3:(dim(subconjunto_amelia21)[2])){
+    subconjunto_amelia21[i,j] <- (imputados21$imp1[i,j]+imputados21$imp2[i,j]+
+                           imputados21$imp3[i,j]+ imputados21$imp4[i,j]+ 
+                           imputados21$imp5[i,j])/5
+  }
+}
+amelia_sdg22 <- amelia(subconjunto22, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados22 <- amelia_sdg22$imputations
+subconjunto_amelia22 <- subconjunto22
+
+for(i in 1:(dim(subconjunto_amelia22)[1])){
+  for(j in 3:(dim(subconjunto_amelia22)[2])){
+    subconjunto_amelia22[i,j] <- (imputados22$imp1[i,j]+imputados22$imp2[i,j]+
+                           imputados22$imp3[i,j]+ imputados22$imp4[i,j]+ 
+                           imputados22$imp5[i,j])/5
+  }
+}
+amelia_sdg23 <- amelia(subconjunto23, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados23 <- amelia_sdg23$imputations
+subconjunto_amelia23 <- subconjunto23
+
+for(i in 1:(dim(subconjunto_amelia23)[1])){
+  for(j in 3:(dim(subconjunto_amelia23)[2])){
+    subconjunto_amelia23[i,j] <- (imputados23$imp1[i,j]+imputados23$imp2[i,j]+
+                           imputados23$imp3[i,j]+ imputados23$imp4[i,j]+ 
+                           imputados23$imp5[i,j])/5
+  }
+}
+
+amelia_sdg24 <- amelia(subconjunto24, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados24 <- amelia_sdg24$imputations
+subconjunto_amelia24 <- subconjunto24
+
+for(i in 1:(dim(subconjunto_amelia24)[1])){
+  for(j in 3:(dim(subconjunto_amelia24)[2])){
+    subconjunto_amelia24[i,j] <- (imputados24$imp1[i,j]+imputados24$imp2[i,j]+
+                           imputados24$imp3[i,j]+ imputados24$imp4[i,j]+ 
+                           imputados24$imp5[i,j])/5
+  }
+}
+
+
+
+
+
+amelia_sdg31 <- amelia(subconjunto31, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados31 <- amelia_sdg31$imputations
+subconjunto_amelia31 <- subconjunto31
+
+for(i in 1:(dim(subconjunto_amelia31)[1])){
+  for(j in 3:(dim(subconjunto_amelia31)[2])){
+    subconjunto_amelia31[i,j] <- (imputados31$imp1[i,j]+imputados31$imp2[i,j]+
+                           imputados31$imp3[i,j]+ imputados31$imp4[i,j]+ 
+                           imputados31$imp5[i,j])/5
+  }
+}
+
+
+
+amelia_sdg32 <- amelia(subconjunto32, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados32 <- amelia_sdg32$imputations
+subconjunto_amelia32 <- subconjunto32
+
+for(i in 1:(dim(subconjunto_amelia32)[1])){
+  for(j in 3:(dim(subconjunto_amelia32)[2])){
+    subconjunto_amelia32[i,j] <- (imputados32$imp1[i,j]+imputados32$imp2[i,j]+
+                           imputados32$imp3[i,j]+ imputados32$imp4[i,j]+ 
+                           imputados32$imp5[i,j])/5
+  }
+}
+amelia_sdg33 <- amelia(subconjunto33, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados33 <- amelia_sdg33$imputations
+subconjunto_amelia33 <- subconjunto33
+
+for(i in 1:(dim(subconjunto_amelia33)[1])){
+  for(j in 3:(dim(subconjunto_amelia33)[2])){
+    subconjunto_amelia33[i,j] <- (imputados33$imp1[i,j]+imputados33$imp2[i,j]+
+                           imputados33$imp3[i,j]+ imputados33$imp4[i,j]+ 
+                           imputados33$imp5[i,j])/5
+  }
+}
+
+
+amelia_sdg34 <- amelia(subconjunto34, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados34 <- amelia_sdg34$imputations
+subconjunto_amelia34 <- subconjunto34
+
+for(i in 1:(dim(subconjunto_amelia34)[1])){
+  for(j in 3:(dim(subconjunto_amelia34)[2])){
+    subconjunto_amelia34[i,j] <- (imputados34$imp1[i,j]+imputados34$imp2[i,j]+
+                           imputados34$imp3[i,j]+ imputados34$imp4[i,j]+ 
+                           imputados34$imp5[i,j])/5
+  }
+}
+
+
+
+
+############## 4#############33
+
+
+amelia_sdg41 <- amelia(subconjunto41, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados41 <- amelia_sdg41$imputations
+subconjunto_amelia41 <- subconjunto41
+
+for(i in 1:(dim(subconjunto_amelia41)[1])){
+  for(j in 3:(dim(subconjunto_amelia41)[2])){
+    subconjunto_amelia41[i,j] <- (imputados41$imp1[i,j]+imputados41$imp2[i,j]+
+                           imputados41$imp3[i,j]+ imputados41$imp4[i,j]+ 
+                           imputados41$imp5[i,j])/5
+  }
+}
+
+
+
+amelia_sdg42 <- amelia(subconjunto42, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados42 <- amelia_sdg42$imputations
+subconjunto_amelia42 <- subconjunto42
+
+for(i in 1:(dim(subconjunto_amelia42)[1])){
+  for(j in 3:(dim(subconjunto_amelia42)[2])){
+    subconjunto_amelia42[i,j] <- (imputados42$imp1[i,j]+imputados42$imp2[i,j]+
+                           imputados42$imp3[i,j]+ imputados42$imp4[i,j]+ 
+                           imputados42$imp5[i,j])/5
+  }
+}
+amelia_sdg43 <- amelia(subconjunto43, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados43 <- amelia_sdg43$imputations
+subconjunto_amelia43 <- subconjunto43
+
+for(i in 1:(dim(subconjunto_amelia43)[1])){
+  for(j in 3:(dim(subconjunto_amelia43)[2])){
+    subconjunto_amelia43[i,j] <- (imputados43$imp1[i,j]+imputados43$imp2[i,j]+
+                           imputados43$imp3[i,j]+ imputados43$imp4[i,j]+ 
+                           imputados43$imp5[i,j])/5
+  }
+}
+
+
+amelia_sdg44 <- amelia(subconjunto44, m = 5, ts = "TimePeriod", cs = "GeoAreaName")
+imputados44 <- amelia_sdg44$imputations
+subconjunto_amelia44 <- subconjunto44
+
+for(i in 1:(dim(subconjunto_amelia44)[1])){
+  for(j in 3:(dim(subconjunto_amelia44)[2])){
+    subconjunto_amelia44[i,j] <- (imputados44$imp1[i,j]+imputados44$imp2[i,j]+
+                           imputados44$imp3[i,j]+ imputados44$imp4[i,j]+ 
+                           imputados44$imp5[i,j])/5
+  }
+}
+
+
+
+
+am1 <- cbind(subconjunto_amelia11,subconjunto_amelia12[,-c(1:2)],subconjunto_amelia13[,-c(1:2)],subconjunto_amelia14[,-c(1:2)])
+
+am2 <- cbind(subconjunto_amelia21,subconjunto_amelia22[,-c(1:2)],subconjunto_amelia23[,-c(1:2)],subconjunto_amelia24[,-c(1:2)])
+
+am3 <- cbind(subconjunto_amelia31,subconjunto_amelia32[,-c(1:2)],subconjunto_amelia33[,-c(1:2)],subconjunto_amelia34[,-c(1:2)])
+
+am3 <- cbind(subconjunto_amelia41,subconjunto_amelia42[,-c(1:2)],subconjunto_amelia43[,-c(1:2)],subconjunto_amelia44[,-c(1:2)])
+
+amelia_completo <- rbind(am1,am2,am3) 
+```
+
+
+The method is extremely slow and the imputations are very bad
+
+# Indicators method
+
+```{r}
+# Función personalizada para calcular la media considerando NA
+mean_with_na <- function(x) {
+  if (!any(is.na(x))) {
+    return(trapz(x))
+  } else {
+    return(NA)
+  }
+}
+rankings_indicadores <- datos_normalizados %>%
+  group_by(GeoAreaName) %>%
+  summarise(across(`5.5.1: Proportion of seats held by women in national parliaments (% of total number of seats)`:`17.8.1: Proportion of individuals using the Internet (%)`, mean_with_na))
+
+rankings_indicadores <- as.data.frame(rankings_indicadores)
+# Crear una nueva matriz para almacenar los resultados del ranking
+ranking_paises <- matrix(NA_character_, nrow = nrow(rankings_indicadores), ncol = ncol(rankings_indicadores))
+
+# Calcular el ranking para cada columna
+for (i in 2:ncol(rankings_indicadores)) {
+  ranking_indices <- order(rankings_indicadores[, i], decreasing = TRUE)
+  ranking_paises[, i] <- rankings_indicadores$GeoAreaName
+  ranking_paises[is.na(rankings_indicadores[, i]), i] <- NA
+  ranking_paises[, i] <- ranking_paises[ranking_indices, i]
+}
+
+ranking_paises <- ranking_paises[, -1]
+
+colnames(ranking_paises) <- colnames(rankings_indicadores)[-1]
+```
+
+# Primera forma:
+
+```{r}
+datos_completos_ranking <- datos_normalizados
+
+
+quantile_method<- function(datos_completos_ranking,parejas,indicadores_cercanos,ranking_paises,datos_normalizados){
+  for(pais_indicador in parejas){
+  print(pais_indicador)
+  i=1
+  pais <- pais_indicador[1]
+  indicador <- pais_indicador[2]
+  posicion_indicador <- which(names(indicadores_cercanos)==indicador)
+  cerca_indicador <- indicadores_cercanos[posicion_indicador]
+  # Seleccionar indicador parecido en el que el pais tenga datos.
+  while(i<16){
+    datos <- datos_normalizados[datos_normalizados$GeoAreaName==pais,][,cerca_indicador[[1]][i]]
+    if(anyNA(datos)){
+    i = i+1
+    }else{
+      indicador_cercano_con_datos <- i
+      i=30
+    }
+  }
+
+  indicador_mas_cercano <- cerca_indicador[[1]][indicador_cercano_con_datos]
+  ranking_indicador_cercano <- na.omit(ranking_paises[,indicador_mas_cercano])
+
+  position <- which(ranking_indicador_cercano == pais) 
+
+  
+  cuantil <-  position / length(ranking_indicador_cercano)
+
+  ranking_indicador <- na.omit(ranking_paises[,indicador])
+
+  index <- round(length(ranking_indicador) * cuantil)
+
+  if(index==0){
+    index=1
+  }
+  # Obtener el país en el índice calculado
+  pais_semejante <- ranking_indicador[index]
+  
+  relleno <- datos_completos_ranking[datos_completos_ranking$GeoAreaName==pais_semejante,][,indicador]
+  
+  indices_faltantes <- (is.na(datos_completos_ranking[datos_completos_ranking$GeoAreaName == pais_indicador[1], pais_indicador[2]]))
+  
+  datos_completos_ranking[datos_completos_ranking$GeoAreaName == pais_indicador[1], pais_indicador[2]][indices_faltantes] <-  relleno[indices_faltantes]
+  
+  }
+  return(datos_completos_ranking)
+}
+
+datos_completos_ranking <- quantile_method(datos_completos_ranking,parejas,indicadores_cercanos,ranking_paises,datos_normalizados)
+```
+
+# Segunda forma:
+
+
+```{r, eval=FALSE, echo=FALSE}
+
+datos_completos_ranking2 <- datos_normalizados
+for(pais_indicador in parejas){
+  #print(pais_indicador)
+  i=1
+  print(pais_indicador)
+  pais <- pais_indicador[1]
+  indicador <- pais_indicador[2]
+  posicion_pais <- which(names(paises_cercanos)==pais)
+  cerca_pais <- paises_cercanos[posicion_pais]
+  posicion_indicador <- which(names(indicadores_cercanos)==indicador)
+  cerca_indicador <- indicadores_cercanos[posicion_indicador]
+  # Seleccionar indicador parecido en el que el pais tenga datos.
+  while(i<16){
+    datos <- datos_completos_ranking2[datos_completos_ranking2$GeoAreaName==pais,][,cerca_indicador[[1]][i]]
+    if(anyNA(datos)){
+    i = i+1
+    }else{
+      indicador_cercano_con_datos <- i
+      i=16
+    }
+  }
+  indicador_mas_cercano <- cerca_indicador[[1]][indicador_cercano_con_datos]
+  ranking_indicador_cercano <- ranking_paises[,indicador_mas_cercano]
+  pos <- which(ranking_indicador_cercano==pais)
+  paises_a_tener_en_cuenta <- na.omit(ranking_indicador_cercano[((pos-5):(pos+5))[(pos-5):(pos+5)>0]][-6])
+  m = 0
+  relleno = 0
+  for (pais_cerca in paises_a_tener_en_cuenta) {
+    datos <- datos_completos_ranking2[datos_completos_ranking2$GeoAreaName==pais_cerca,][,indicador]
+    if(!anyNA(datos)){
+      relleno <- relleno +datos
+      m <- m+1
+    }
+  }
+  relleno <- relleno/m
+  datos_completos_ranking2[datos_completos_ranking2$GeoAreaName==pais,][,indicador] <- relleno
+  
+  
+}
+```
+
+
+# Media method
+
+```{r}
+datos_completos <- datos_normalizados
+
+media_method <- function(parejas,datos_completos,n=9,paises_cercanos){
+  for (pais_indicador in parejas) {
+  pais <- pais_indicador[1]
+  posicion <- which(names(paises_cercanos)==pais)
+  cerca <- paises_cercanos[posicion]
+  i=1
+  j=1
+  relleno <- rep(0,23)
+  while(i <= 100 & j <= n ){
+    if(!anyNA(datos_completos[datos_completos$GeoAreaName == cerca[[1]][i], pais_indicador[2]])){
+      relleno <- relleno +  datos_completos[datos_completos$GeoAreaName == cerca[[1]][i], pais_indicador[2]]
+      j=j+1
+      i=i+1
+    }else{
+    i =i+1
+  }
+  }
+  relleno <- relleno/n
+  
+  indices_faltantes <- (is.na(datos_completos[datos_completos$GeoAreaName == pais_indicador[1], pais_indicador[2]]))
+  
+  datos_completos[datos_completos$GeoAreaName == pais_indicador[1], pais_indicador[2]][indices_faltantes] <-  relleno[indices_faltantes]
+  
+}
+  return(datos_completos)
+}
+
+
+
+datos_completos <- media_method(parejas,datos_completos,n=9,paises_cercanos)
+
+#View(datos_completos)
+```
+
+Data is filled, but there are still many errors that need to be dealt with.
+
+
+
+# Efficiency test:
+
+Guardamos los datos presentes, para decidir aleatoriamente cuales borrar:
+
+```{r}
+missing_data_2 <- datos_normalizados %>%
+  group_by(GeoAreaName) %>%
+  summarise_all(~sum(is.na(.))/n()*100) %>%
+  pivot_longer(cols = -GeoAreaName, names_to = "indicador", values_to = "porcentaje")
+
+missing_data_table_2 <- pivot_wider(missing_data_2, names_from = indicador, values_from = porcentaje)
+missing_data_table_2 <- as.data.frame(missing_data_table_2)
+
+coordenadas <- which(missing_data_table_2 == 0 & class(missing_data_table_2)!="character", arr.ind = TRUE)
+#head(coordenadas)
+coordenadas80 <- coordenadas[-(1:dim(missing_data_table_2)[1]),]
+#head(coordenadas80)
+dimtab <- dim(missing_data_table_2)-c(0,2)
+100*dim(coordenadas80)[1]/(dimtab[1]*dimtab[2])
+
+con_datos_2 <- data.frame(
+  Pais = missing_data_table_2[,1][coordenadas80[, 1]],
+  Indicador = colnames(missing_data_table_2)[coordenadas80[, 2]]
+)
+
+lista_parejas_2 <- lapply(1:nrow(con_datos_2), function(i) c(con_datos_2$Pais[i], con_datos_2$Indicador[i]))
+
+```
+
+valores que vamos a retirar:
+
+```{r}
+set.seed(123)
+n=500
+
+a_eliminar <- sample(lista_parejas_2, n, replace = FALSE)
+```
+
+creamos el conjunto de prueba:
+
+```{r}
+conjunto_prueba <- datos_normalizados
+
+na <- rep(NA,23)
+
+for(pais_indicador in a_eliminar){
+  conjunto_prueba[conjunto_prueba$GeoAreaName==pais_indicador[1],pais_indicador[2]]<- na
+}
+```
+
+una vez tenemos nuestro conjunto de prueba, podemos empezar a rellenar con los tres métodos:
+
+```{r}
+tablas2 <- conjunto_prueba %>%
+  group_by(GeoAreaName) %>%
+  summarise_all(~sum(is.na(.))/n()*100) %>%
+  pivot_longer(cols = -GeoAreaName, names_to = "indicador", values_to = "porcentaje")
+
+tablas_2 <- pivot_wider(tablas2, names_from = indicador, values_from = porcentaje)
+tablas_2 <- as.data.frame(tablas_2)
+
+coordenadas <- which(tablas_2 > 0 & class(tablas_2)!="character", arr.ind = TRUE)
+#head(coordenadas)
+coordenadas80 <- coordenadas[-(1:(dim(tablas_2)[1])),]
+#head(coordenadas80)
+dimtab <- dim(tablas2)-c(0,2)
+# Porcentaje de datos que tendré que rellenar comparando con paises cercanos.
+100*dim(coordenadas80)[1]/(dimtab[1]*dimtab[2])
+
+sin_datos_2 <- data.frame(
+  Pais = tablas_2[,1][coordenadas80[, 1]],
+  Indicador = colnames(tablas_2)[coordenadas80[, 2]]
+)
+
+parejas_2 <- lapply(1:nrow(sin_datos_2), function(i) c(sin_datos_2$Pais[i], sin_datos_2$Indicador[i]))
+```
+
+empezamos a rellenar, primero con el método de la media:
+
+```{r}
+datos_completos_prueba <- conjunto_prueba
+
+datos_completos_prueba <- media_method(parejas_2,conjunto_prueba,3,paises_cercanos)
+```
+
+calculamos el error:
+
+```{r}
+error_total <- 0
+for(pais_indicador in a_eliminar){
+  resta <- datos_completos_prueba[datos_completos_prueba$GeoAreaName==pais_indicador[1],pais_indicador[2]]-datos_normalizados[datos_normalizados$GeoAreaName==pais_indicador[1],pais_indicador[2]]
+  error <- norm(resta, type = "2")
+  error_total <- error_total+error
+}
+error_total <- error_total/n
+error_total
+```
+¿Y si tomo 5 paises?:
+
+
+```{r}
+datos_completos_prueba5 <- conjunto_prueba
+
+datos_completos_prueba5 <- media_method(parejas_2,conjunto_prueba,5,paises_cercanos)
+```
+
+calculamos el error:
+
+```{r}
+error_total <- 0
+for(pais_indicador in a_eliminar){
+  resta <- datos_completos_prueba5[datos_completos_prueba5$GeoAreaName==pais_indicador[1],pais_indicador[2]]-datos_normalizados[datos_normalizados$GeoAreaName==pais_indicador[1],pais_indicador[2]]
+  error <- norm(resta, type = "2")
+  error_total <- error_total+error
+}
+error_total <- error_total/n
+error_total
+```
+
+
+AHORA CON 10 (oie con cuatro va to bien)
+
+```{r}
+datos_completos_prueba10 <- conjunto_prueba
+
+datos_completos_prueba10 <- media_method(parejas_2,conjunto_prueba,10,paises_cercanos)
+```
+
+calculamos el error:
+
+```{r}
+error_total <- 0
+for(pais_indicador in a_eliminar){
+  resta <- datos_completos_prueba10[datos_completos_prueba10$GeoAreaName==pais_indicador[1],pais_indicador[2]]-datos_normalizados[datos_normalizados$GeoAreaName==pais_indicador[1],pais_indicador[2]]
+  error <- norm(resta, type = "2")
+  error_total <- error_total+error
+}
+error_total <- error_total/n
+error_total
+```
+
+
+ahora con el método de los indices:
+
+pero primero he de hacer un nuevo ranking :(
+
+```{r}
+mean_with_na <- function(x) {
+  if (!any(is.na(x))) {
+    return(trapz(x))
+  } else {
+    return(NA)
+  }
+}
+rankings_indicadores <- conjunto_prueba %>%
+  group_by(GeoAreaName) %>%
+  summarise(across(`5.5.1: Proportion of seats held by women in national parliaments (% of total number of seats)`:`17.8.1: Proportion of individuals using the Internet (%)`, mean_with_na))
+
+rankings_indicadores <- as.data.frame(rankings_indicadores)
+
+
+# Crear una nueva matriz para almacenar los resultados del ranking
+ranking_paises <- matrix(NA_character_, nrow = nrow(rankings_indicadores), ncol = ncol(rankings_indicadores))
+
+# Calcular el ranking para cada columna
+for (i in 2:ncol(rankings_indicadores)) {
+  # Obtener el índice de orden ascendente
+  ranking_indices <- order(rankings_indicadores[, i], decreasing = TRUE)
+  
+  # Obtener el nombre de los países en el orden del ranking
+  ranking_paises[, i] <- rankings_indicadores$GeoAreaName
+  
+  # Reemplazar con NA los países que tienen valor NA en el indicador correspondiente
+  ranking_paises[is.na(rankings_indicadores[, i]), i] <- NA
+  
+  # Ordenar los nombres de los países según el ranking
+  ranking_paises[, i] <- ranking_paises[ranking_indices, i]
+}
+
+# Eliminar la columna original de los nombres de los países
+ranking_paises <- ranking_paises[, -1]
+
+
+# Asignar el nombre de la columna original (indicador) a la nueva matriz
+colnames(ranking_paises) <- colnames(rankings_indicadores)[-1]
+
+#ranking_paises2 <- ranking_paises
+```
+
+
+```{r}
+datos_completos_ranking_prueba <- conjunto_prueba
+
+datos_completos_ranking_prueba <- quantile_method(datos_completos_ranking_prueba,parejas_2,indicadores_cercanos, ranking_paises, conjunto_prueba)
+```
+
+calculamos el error:
+
+```{r}
+error_total <- 0
+for(pais_indicador in a_eliminar){
+  resta <- datos_completos_ranking_prueba[datos_completos_ranking_prueba$GeoAreaName==pais_indicador[1],pais_indicador[2]]-datos_normalizados[datos_normalizados$GeoAreaName==pais_indicador[1],pais_indicador[2]]
+  error <- norm(resta, type = "2")
+  error_total <- error_total+error
+}
+error_total <- error_total/n
+error_total
+```
+
+
+# 17 SDGs
+
+```{r}
+
+#datos_completos <- datos_completos_ranking
+
+SDG1 <- (1/3)*datos_completos$`1.1.1: Proportion of population below international poverty line (%)`+(1/6)*datos_completos$`1.4.1: Proportion of population using basic drinking water services, by location (%)`+(1/6)*datos_completos$`1.4.1: Proportion of population using basic sanitation services, by location (%)`+(0)*datos_completos$`1.5.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`+(0)*datos_completos$`1.5.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`+(1/6)*datos_completos$`1.a.1: Official development assistance grants for poverty reduction, by recipient countries (percentage of GNI)`+(1/6)*datos_completos$`1.a.2: Proportion of total government spending on essential services, education (%)`
+
+SDG2 <- (1/5)*datos_completos$`2.1.1: Prevalence of undernourishment (%)`+(1/15)*datos_completos$`2.2.1: Proportion of children moderately or severely stunted (%)`+(1/15)*datos_completos$`2.2.2: Proportion of children moderately or severely overweight (%)`+(1/45)*datos_completos$`2.2.3: Proportion of women aged 15-49 years with anaemia (%)`+(1/45)*datos_completos$`2.2.3: Proportion of women aged 15-49 years with anaemia, non-pregnant (%)`+(1/45)*datos_completos$`2.2.3: Proportion of women aged 15-49 years with anaemia, pregnant (%)`+(1/5)*datos_completos$`2.5.2: Proportion of local breeds classified as being at risk as a share of local breeds with known level of extinction risk (%)`+(1/15)*datos_completos$`2.a.1: Agriculture orientation index for government expenditures`+(1/15)*datos_completos$`2.a.1: Agriculture share of Government Expenditure (%)`+(1/15)*datos_completos$`2.a.1: Agriculture value added share of GDP (%)`+(1/5)*datos_completos$`2.c.1: Indicator of Food Price Anomalies (IFPA), by Consumer Food Price Index`
+
+SDG3 <- (1/6)*datos_completos$`3.1.2: Proportion of births attended by skilled health personnel (%)`+(1/24)*datos_completos$`3.2.1: Infant mortality rate (deaths per 1,000 live births)`+(1/24)*datos_completos$`3.2.1: Under-five mortality rate, by sex (deaths per 1,000 live births)`+(1/12)*datos_completos$`3.2.2: Neonatal mortality rate (deaths per 1,000 live births)`+(1/18)*datos_completos$`3.3.1: Number of new HIV infections per 1,000 uninfected population, by sex and age (per 1,000 uninfected population)`+(1/18)*datos_completos$`3.3.2: Tuberculosis incidence (per 100,000 population)`+(1/18)*datos_completos$`3.3.3: Malaria incidence per 1,000 population at risk (per 1,000 population)`+(1/12)*datos_completos$`3.b.1: Proportion of the target population with access to 3 doses of diphtheria-tetanus-pertussis (DTP3) (%)`+(1/12)*datos_completos$`3.b.1: Proportion of the target population with access to measles-containing-vaccine second-dose (MCV2) (%)`+(1/6)*datos_completos$`3.c.1: Health worker density, by type of occupation (per 10,000 population)`+(1/6)*datos_completos$`3.d.1: International Health Regulations (IHR) capacity, by type of IHR capacity (%)`
+  
+SDG4 <- (1/5)*datos_completos$`4.1.2: Completion rate, by sex, location, wealth quintile and education level (%)`+ (1/5)*datos_completos$`4.2.2: Participation rate in organized learning (one year before the official primary entry age), by sex (%)`+(1/5)*datos_completos$`4.3.1: Participation rate in formal and non-formal education and training, by sex (%)`+ (1/20)*datos_completos$`4.5.1: Adjusted gender parity index for participation rate in organized learning (one year before the official primary entry age), (ratio)`+(1/20)*datos_completos$`4.5.1: Adjusted gender parity index for completion rate, by location, wealth quintile and education level`+(1/20)*datos_completos$`4.5.1: Adjusted gender parity index for participation rate in formal and non-formal education and training (ratio)`+(1/20)*datos_completos$`4.5.1: Adjusted gender parity index for the proportion of teachers with the minimum required qualifications, by education level (ratio)`+(1/5)*datos_completos$`4.c.1: Proportion of teachers with the minimum required qualifications, by education level and sex (%)`
+
+SDG5 <- (1/2)*datos_completos$`5.5.1: Proportion of seats held by women in national parliaments (% of total number of seats)`+(1/2)*datos_completos$`5.5.2: Proportion of women in managerial positions - 13th ICLS (%)`
+
+  SDG6 <- (1/4)*datos_completos$`6.1.1: Proportion of population using safely managed drinking water services, by urban/rural (%)`+(1/8)*datos_completos$`6.2.1: Proportion of population practicing open defecation, by urban/rural (%)`+(1/8)*datos_completos$`6.2.1: Proportion of population using safely managed sanitation services, by urban/rural (%)`+(1/8)*datos_completos$`6.4.1: Water Use Efficiency (United States dollars per cubic meter)`+(1/8)*datos_completos$`6.4.2: Level of water stress: freshwater withdrawal as a proportion of available freshwater resources (%)`+(1/24)*datos_completos$`6.6.1: Lakes and rivers permanent water area change (%)`+(1/24)*datos_completos$`6.6.1: Lakes and rivers permanent water area (% of total land area)`+(1/24)*datos_completos$`6.6.1: Lakes and rivers seasonal water area (% of total land area)`+(1/24)*datos_completos$`6.6.1: Lakes and rivers seasonal water area change (%)`+(1/24)*datos_completos$`6.6.1: Reservoir minimum water area (% of total land area)`+(1/24)*datos_completos$`6.6.1: Reservoir maximum water area (% of total land area)`
+  
+SDG7 <- (1/8)*datos_completos$`7.1.1: Proportion of population with access to electricity, by urban/rural (%)`+(1/8)*datos_completos$`7.1.2: Proportion of population with primary reliance on clean fuels and technology (%)`+(1/4)*datos_completos$`7.2.1: Renewable energy share in the total final energy consumption (%)`+(1/4)*datos_completos$`7.3.1: Energy intensity level of primary energy (megajoules per constant 2017 purchasing power parity GDP)`+(1/4)*datos_completos$`7.b.1: Installed renewable electricity-generating capacity (watts per capita)`
+
+SDG8 <- (1/5)*datos_completos$`8.1.1: Annual growth rate of real GDP per capita (%)`+(1/10)*datos_completos$`8.10.1: Number of automated teller machines (ATMs) per 100,000 adults`+(1/10)*datos_completos$`8.10.1: Number of commercial bank branches per 100,000 adults`+(1/5)*datos_completos$`8.2.1: Annual growth rate of real GDP per employed person (%)`+(1/5)*datos_completos$`8.5.2: Unemployment rate, by sex and age - 13th ICLS (%)`+(1/5)*datos_completos$`8.6.1: Proportion of youth not in education, employment or training, by sex and age - 13th ICLS (%)`
+
+SDG9 <- (1/6)*datos_completos$`9.1.2: Container port traffic, maritime transport (twenty-foot equivalent units - TEUs)`+(1/24)*datos_completos$`9.2.1: Manufacturing value added (constant 2015 United States dollars) as a proportion of GDP (%)`+(1/24)*datos_completos$`9.2.1: Manufacturing value added (current United States dollars) as a proportion of GDP (%)`+(1/12)*datos_completos$`9.2.2: Manufacturing employment as a proportion of total employment - 13th ICLS (%)`+(1/6)*datos_completos$`9.4.1: Carbon dioxide emissions from fuel combustion (millions of tonnes)`+(1/12)*datos_completos$`9.5.1: Research and development expenditure as a proportion of GDP (%)`+(1/12)*datos_completos$`9.5.2: Researchers (in full-time equivalent) per million inhabitants (per 1,000,000 population)`+(1/6)*datos_completos$`9.b.1: Proportion of medium and high-tech manufacturing value added in total value added (%)`+(1/18)*datos_completos$`9.c.1: Proportion of population covered by at least a 2G mobile network (%)`+(1/18)*datos_completos$`9.c.1: Proportion of population covered by at least a 3G mobile network (%)`+(1/18)*datos_completos$`9.c.1: Proportion of population covered by at least a 4G mobile network (%)`
+
+SDG10 <- (1/6)*datos_completos$`10.2.1: Proportion of people living below 50 percent of median income (%)`+(1/6)*datos_completos$`10.4.1: Labour share of GDP (%)`+(1/42)*datos_completos$`10.5.1: Non-performing loans to total gross loans (%)`+(1/42)*datos_completos$`10.5.1: Return on assets (%)`+(1/42)*datos_completos$`10.5.1: Regulatory capital to assets (%)`+(1/42)*datos_completos$`10.5.1: Non-performing loans net of provisions to capital (%)`+(1/42)*datos_completos$`10.5.1: Regulatory Tier 1 capital to risk-weighted assets (%)`+(1/42)*datos_completos$`10.5.1: Liquid assets to short term liabilities (%)`+(1/42)*datos_completos$`10.5.1: Net open position in foreign exchange to capital (%)`+(1/12)*datos_completos$`10.6.1: Proportion of members of developing countries in international organizations, by organization (%)`+(1/12)*datos_completos$`10.6.1: Proportion of voting rights of developing countries in international organizations, by organization (%)`+(1/6)*datos_completos$`10.7.4: Number of refugees per 100,000 population, by country of origin (per 100,000 population)`+(1/6)*datos_completos$`10.a.1: Proportion of tariff lines applied to imports with zero-tariff (%)`
+  
+SDG11 <- (0)*datos_completos$`11.5.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`+(0)*datos_completos$`11.5.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`+(1)*datos_completos$`11.6.2: Annual mean levels of fine particulate matter (population-weighted), by location (micrograms per cubic meter)`
+  
+SDG12 <- datos_completos$`12.a.1: Installed renewable electricity-generating capacity (watts per capita)`
+  
+SDG13 <- (1/2)*datos_completos$`13.1.1: Number of deaths and missing persons attributed to disasters per 100,000 population (number)`+(1/2)*datos_completos$`13.1.1: Number of directly affected persons attributed to disasters per 100,000 population (number)`
+
+SDG14 <- (1/2)*datos_completos$`14.1.1: Chlorophyll-a deviations, remote sensing (%)`+(1/2)*datos_completos$`14.5.1: Average proportion of Marine Key Biodiversity Areas (KBAs) covered by protected areas (%)`
+
+SDG15 <- (1/6)*datos_completos$`15.1.2: Average proportion of Freshwater Key Biodiversity Areas (KBAs) covered by protected areas (%)`+(1/6)*datos_completos$`15.1.2: Average proportion of Terrestrial Key Biodiversity Areas (KBAs) covered by protected areas (%)`+(1/3)*datos_completos$`15.4.1: Average proportion of Mountain Key Biodiversity Areas (KBAs) covered by protected areas (%)`+(1/3)*datos_completos$`15.5.1: Red List Index`
+
+SDG16 <- (1/4)*datos_completos$`16.1.1: Number of victims of intentional homicide per 100,000 population, by sex (victims per 100,000 population)`+(1/4)*datos_completos$`16.3.2: Unsentenced detainees as a proportion of overall prison population (%)`+(1/4)*datos_completos$`16.6.1: Primary government expenditures as a proportion of original approved budget (%)`+(1/8)*datos_completos$`16.8.1: Proportion of members of developing countries in international organizations, by organization (%)`+(1/8)*datos_completos$`16.8.1: Proportion of voting rights of developing countries in international organizations, by organization (%)`
+
+SDG17 <- (1/8)*datos_completos$`17.1.1: Total government revenue (budgetary central government) as a proportion of GDP (%)`+(1/8)*datos_completos$`17.1.2: Proportion of domestic budget funded by domestic taxes (% of GDP)`+(1/16)*datos_completos$`17.12.1: Average tariff applied by developed countries, most-favored nation status, by type of product (%)`+(1/16)*datos_completos$`17.12.1: Average tariff applied by developed countries, preferential status, by type of product (%)`+(1/144)*datos_completos$`17.13.1: Current account balance as a proportion of GDP (%)`+(1/144)*datos_completos$`17.13.1: Foreign direct investment, net inflows, as a proportion of GDP (%)`+(1/144)*datos_completos$`17.13.1: External debt stocks as a proportion of GNI (%)`+(1/144)*datos_completos$`17.13.1: Bank capital to assets ratio (%)`+(1/144)*datos_completos$`17.13.1: Total reserves in months of imports (ratio)`+(1/144)*datos_completos$`17.13.1: Broad money to total reserves ratio`+(1/144)*datos_completos$`17.13.1: Annual broad money growth (%)`+(1/144)*datos_completos$`17.13.1: Annual inflation, consumer prices (%)`+(1/144)*datos_completos$`17.13.1: Cash surplus/deficit as a proportion of GDP (%)`+(1/144)*datos_completos$`17.13.1: Tax revenue as a proportion of GDP (%)`+(1/144)*datos_completos$`17.13.1: Annual growth of the general government final consumption expenditure (%)`+(1/144)*datos_completos$`17.13.1: Annual growth of households and NPISHs final consumption expenditure (%)`+(1/144)*datos_completos$`17.13.1: Annual growth of exports of goods and services (%)`+(1/144)*datos_completos$`17.13.1: Annual growth of the gross capital formation (%)`+(1/144)*datos_completos$`17.13.1: Annual growth of imports of goods and services (%)`+(1/144)*datos_completos$`17.13.1: Annual GDP growth (%)`+(1/144)*datos_completos$`17.13.1: DEC alternative conversion factor (in local currency unit per United States dollar)`+(1/144)*datos_completos$`17.13.1: Merchandise trade as a proportion of GDP (%)` +(1/8)*datos_completos$`17.3.2: Volume of remittances (in United States dollars) as a proportion of total GDP (%)`+(1/8)*datos_completos$`17.4.1: Debt service as a proportion of exports of goods and services (%)`+(1/8)*datos_completos$`17.6.1: Fixed broadband subscriptions per 100 inhabitants, by speed (per 100 inhabitants)`+(1/8)*datos_completos$`17.8.1: Proportion of individuals using the Internet (%)`
+
+datos_17SDG <-as.data.frame(cbind(datos_completos$GeoAreaName,datos_completos$TimePeriod,SDG1,SDG2,SDG3,SDG4,SDG5,SDG6,SDG7,SDG8,SDG9,SDG10,SDG11,SDG12,SDG13,SDG14,SDG15,SDG16,SDG17))
+
+colnames(datos_17SDG)[colnames(datos_17SDG)=='V1'] <- 'GeoAreaName'
+colnames(datos_17SDG)[colnames(datos_17SDG)=='V2'] <- 'TimePeriod'
+
+
+datos_17SDG$SDG1 <- as.numeric(datos_17SDG$SDG1)
+datos_17SDG$SDG2 <- as.numeric(datos_17SDG$SDG2)
+datos_17SDG$SDG3 <- as.numeric(datos_17SDG$SDG3)
+datos_17SDG$SDG4 <- as.numeric(datos_17SDG$SDG4)
+datos_17SDG$SDG5 <- as.numeric(datos_17SDG$SDG5)
+datos_17SDG$SDG6 <- as.numeric(datos_17SDG$SDG6)
+datos_17SDG$SDG7 <- as.numeric(datos_17SDG$SDG7)
+datos_17SDG$SDG8 <- as.numeric(datos_17SDG$SDG8)
+datos_17SDG$SDG9 <- as.numeric(datos_17SDG$SDG9)
+datos_17SDG$SDG10 <- as.numeric(datos_17SDG$SDG10)
+datos_17SDG$SDG11 <- as.numeric(datos_17SDG$SDG11)
+datos_17SDG$SDG12 <- as.numeric(datos_17SDG$SDG12)
+datos_17SDG$SDG13 <- as.numeric(datos_17SDG$SDG13)
+datos_17SDG$SDG14 <- as.numeric(datos_17SDG$SDG14)
+datos_17SDG$SDG15 <- as.numeric(datos_17SDG$SDG15)
+datos_17SDG$SDG16 <- as.numeric(datos_17SDG$SDG16)
+datos_17SDG$SDG17 <- as.numeric(datos_17SDG$SDG17)
+datos_17SDG$TimePeriod <- as.numeric(datos_17SDG$TimePeriod)
+```
+
+# SDGs ranking
+
+Using the available data, we are calculating the average of all values to generate a ranking of countries based on their SDGs evolution.
+
+```{r}
+# Calcular la media de todos los datos por país
+################################################
+#datos_completos <- datos_completos_ranking
+##################################################
+
+
+ranking <- aggregate(. ~ GeoAreaName, data = datos_17SDG, FUN = mean)
+
+ranking2022 <- datos_17SDG[datos_17SDG$TimePeriod==2022,]
+
+# Calcular la media de cada fila
+
+ranking <- rowMeans(ranking[, -c(1, 2,15)], na.rm = TRUE)
+ranking2022 <- rowMeans(ranking2022[, -c(1, 2,15)], na.rm = TRUE)
+
+countries <- unique(data_sdg2$GeoAreaName)
+
+ranking <- as.data.frame(cbind(countries, ranking))
+ranking <- ranking[order(ranking$ranking, decreasing = TRUE), ]
+
+ranking2022 <- as.data.frame(cbind(countries, ranking2022))
+ranking2022 <- ranking2022[order(ranking2022$ranking2022, decreasing = TRUE), ]
+
+head(ranking)
+```
+
+```{r}
+# Supongamos que tu conjunto de datos se llama 'datos_17SDG'
+# Selecciona todas las columnas excepto la primera y la segunda
+columnas_a_promediar <- datos_17SDG[, -c(1, 2)]
+
+# Calcula la media de cada fila
+media_por_fila <- rowMeans(columnas_a_promediar, na.rm = TRUE)
+
+# Crea un nuevo conjunto de datos que incluya 'GeoAreaName' y 'TimePeriod'
+# junto con la media calculada
+ranking_global <- data.frame(
+  GeoAreaName = datos_17SDG$GeoAreaName,
+  TimePeriod = datos_17SDG$TimePeriod,
+  Media = media_por_fila
+)
+
+# Muestra las primeras filas del nuevo dataset
+head(ranking_global)
+grid <- 2000:2022
+data <- matrix(media_por_fila, nrow=23)
+data <- t(data)
+fD_rank <- fData(grid,data) 
+plot(fD_rank,main = 'Evolution of Global SDG index', xlab = 'Time', ylab = 'Index', lwd = 2)
+
+plot(mean(fD_rank), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+#plot(mean(fD_rank), add = TRUE, lwd = 2, col = "black", lty = 2)
+#plot(median_fData(fD, type = "MBD"), lwd = 2, lty = 2, col = "black")
+
+# Datos
+
+datos <- c(51.84507, 52.42241, 53.06421, 53.67290, 54.47741, 56.14868, 56.91909, 57.35133,
+           57.76402, 58.02400, 58.71604, 59.57949, 60.22242, 60.85640, 61.31231, 61.58787,
+           62.14589, 62.44915, 62.68715, 63.19125, 62.04571, 62.68642, 63.01326)
+
+datos <- c(51.99547, 52.57215, 53.21873, 53.80578, 54.65485, 56.13051, 56.88295, 57.37718, 57.80282, 58.05401, 58.79046, 59.61124, 60.25088, 60.87897, 61.34603, 61.64074, 62.23466, 62.56217, 62.77733, 63.30969, 62.36741, 63.00725, 63.34562)
+
+
+
+datos <- diff(datos)
+# Crear un gráfico de barras
+barplot(datos, names.arg = 2001:2022, col = "blue", 
+        main = "Year-over-year growth rates", xlab = "Year", ylab = "Rate")
+
+```
+
+```{r}
+country_list <- split(ranking_global, ranking_global$GeoAreaName)
+
+# Create an empty vector to store the areas
+areas <- numeric(length(country_list))
+
+# Loop through each country and calculate the area
+for (i in 1:length(country_list)) {
+  country_data <- country_list[[i]]
+  areas[i] <- trapz(country_data$TimePeriod, country_data$Media)
+}
+
+# Create a new data frame with country names and their corresponding areas
+areas_df <- data.frame(
+  GeoAreaName = names(country_list),
+  Area = areas
+)
+
+# Print or use 'areas_df' as needed
+head(areas_df)
+areas_df <- areas_df[order(-areas_df$Area), ]
+
+# Print the sorted data frame
+head(areas_df)
+```
+
+```{r}
+mejores_glob <- ranking_global[ranking_global$GeoAreaName %in% c('Finland', 'Sweden','Denmark','Netherlands (Kingdom of the)','Austria','Norway'),] 
+
+ggplot(data = mejores_glob, aes(x = TimePeriod, y = Media, color = GeoAreaName)) +
+  geom_line() +  # Add lines for each country
+  labs(x = "TimePeriod", y = "SDG index") +  # Label axes
+  ggtitle("Best all-time performers") +  # Add a title
+  theme_minimal() +  # Use a minimal theme
+  scale_color_discrete(name = "Country")+ylim(c(60,85))
+
+
+ggplot(data = peores_glob, aes(x = TimePeriod, y = Media, color = GeoAreaName)) +
+  geom_line() +  # Add lines for each country
+  labs(x = "TimePeriod", y = "SDG index") +  # Label axes
+  ggtitle("Worst all-time performers") +  # Add a title
+  theme_minimal() +  # Use a minimal theme
+  scale_color_discrete(name = "Country")+ylim(c(30,55))
+```
+
+```{r}
+ranking2022 <- ranking_global[ranking_global$TimePeriod == 2022,]
+ranking2022 <- ranking2022[order(-ranking2022$Media), ]
+mejores_2022 <- ranking2022[ranking2022$GeoAreaName %in% c('Finland', 'Estonia','Denmark','Poland','Austria','Belgium'),]
+
+peores_2022 <- ranking2022[ranking2022$GeoAreaName %in% c('Niger', 'Chad','Afghanistan','Benin','Yemen','Democratic Republic of the Congo'),]
+
+ggplot(mejores_2022, aes(x = reorder(GeoAreaName, -Media), y = Media, fill = Media)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient(low = "skyblue", high = "blue") +  # Gradient fill color
+  coord_cartesian(ylim = c(75, 82)) +  # Set y-axis limits
+  labs(title = "Best-Performing Countries in 2022",
+       x = "Country",
+       y = "SDG index",
+       fill = "SDG index") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(peores_2022, aes(x = reorder(GeoAreaName, Media), y = Media, fill = Media)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient(low = "skyblue", high = "blue") +  # Gradient fill color
+  coord_cartesian(ylim = c(40, 48)) +  # Set y-axis limits
+  labs(title = "Worst-Performing Countries in 2022",
+       x = "Country",
+       y = "SDG index",
+       fill = "SDG index") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Individual indexes
+
+# 1
+
+```{r}
+Sdg_1 <- datos_17SDG[,c(1,2,3)]
+data1 <- matrix(SDG1, nrow=23)
+data1 <- t(data1)
+SDG_1 <- fData(grid,data1) 
+plot(SDG_1,main = 'SDG 1', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_1), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_1), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank1 <- Sdg_1[Sdg_1$TimePeriod == 2022,]
+rank1 <- rank1[order(-rank1$SDG1),]
+View(rank1)
+```
+
+```{r}
+outliergram(SDG_1)
+```
+
+```{r}
+anomalas1 <- Sdg_1[Sdg_1$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 2
+
+```{r}
+Sdg_2 <- datos_17SDG[,c(1,2,4)]
+data2 <- matrix(SDG2, nrow=23)
+data2 <- t(data2)
+SDG_2 <- fData(grid,data2) 
+plot(SDG_2,main = 'SDG 2', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_2), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_2), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank2 <- Sdg_2[Sdg_2$TimePeriod == 2022,]
+rank2 <- rank2[order(-rank2$SDG2),]
+View(rank2)
+```
+
+```{r}
+outliergram(SDG_2,Fvalue = 3.5)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+# 3
+
+```{r}
+Sdg_3 <- datos_17SDG[,c(1,2,5)]
+data3 <- matrix(SDG3, nrow=23)
+data3 <- t(data3)
+SDG_3 <- fData(grid,data3) 
+plot(SDG_3,main = 'SDG 3', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_3), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_3), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank3 <- Sdg_3[Sdg_3$TimePeriod == 2022,]
+rank3 <- rank3[order(-rank3$SDG3),]
+View(rank3)
+```
+
+```{r}
+outliergram(SDG_3,Fvalue = 1.5)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 4
+
+```{r}
+Sdg_4 <- datos_17SDG[,c(1,2,6)]
+data4 <- matrix(SDG4, nrow=23)
+data4 <- t(data4)
+SDG_4 <- fData(grid,data4) 
+plot(SDG_4,main = 'SDG 4', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_4), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_4), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank4 <- Sdg_4[Sdg_4$TimePeriod == 2022,]
+rank4 <- rank4[order(-rank4$SDG4),]
+View(rank4)
+```
+
+```{r}
+outliergram(SDG_4,Fvalue = 2)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+# 5
+
+```{r}
+Sdg_5 <- datos_17SDG[,c(1,2,7)]
+data5 <- matrix(SDG5, nrow=23)
+data5 <- t(data5)
+SDG_5 <- fData(grid,data5) 
+plot(SDG_5,main = 'SDG 5', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_5), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_5), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank5 <- Sdg_5[Sdg_5$TimePeriod == 2022,]
+rank5 <- rank5[order(-rank5$SDG5),]
+View(rank5)
+```
+
+```{r}
+outliergram(SDG_5,Fvalue = 1.8)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 7
+
+```{r}
+Sdg_7 <- datos_17SDG[,c(1,2,9)]
+data7 <- matrix(SDG7, nrow=23)
+data7 <- t(data7)
+SDG_7 <- fData(grid,data7) 
+plot(SDG_7,main = 'SDG 7', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_7), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_7), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank7 <- Sdg_7[Sdg_7$TimePeriod == 2022,]
+rank7 <- rank7[order(-rank7$SDG7),]
+View(rank7)
+```
+
+```{r}
+outliergram(SDG_7,Fvalue = 4)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+# 6
+
+```{r}
+Sdg_6 <- datos_17SDG[,c(1,2,8)]
+data6 <- matrix(SDG6, nrow=23)
+data6 <- t(data6)
+SDG_6 <- fData(grid,data6) 
+plot(SDG_6,main = 'SDG 6', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_6), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_6), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank6 <- Sdg_6[Sdg_6$TimePeriod == 2022,]
+rank6 <- rank6[order(-rank6$SDG6),]
+View(rank6)
+```
+
+```{r}
+outliergram(SDG_6,Fvalue = 3)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 8
+
+```{r}
+Sdg_8 <- datos_17SDG[,c(1,2,10)]
+data8 <- matrix(SDG8, nrow=23)
+data8 <- t(data8)
+SDG_8 <- fData(grid,data8) 
+plot(SDG_8,main = 'SDG 8', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_8), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_8), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank8 <- Sdg_8[Sdg_8$TimePeriod == 2022,]
+rank8 <- rank8[order(-rank8$SDG8),]
+View(rank8)
+```
+
+```{r}
+outliergram(SDG_8,Fvalue = 1.5)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+# 9
+
+```{r}
+Sdg_9 <- datos_17SDG[,c(1,2,11)]
+data9 <- matrix(SDG9, nrow=23)
+data9 <- t(data9)
+SDG_9 <- fData(grid,data9) 
+plot(SDG_9,main = 'SDG 9', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_9), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_9), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank9 <- Sdg_9[Sdg_9$TimePeriod == 2022,]
+rank9 <- rank9[order(-rank9$SDG9),]
+View(rank9)
+```
+
+```{r}
+outliergram(SDG_9,Fvalue = 1.5)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 10
+
+```{r}
+Sdg_10 <- datos_17SDG[,c(1,2,12)]
+data10 <- matrix(SDG10, nrow=23)
+data10 <- t(data10)
+SDG_10 <- fData(grid,data10) 
+plot(SDG_10,main = 'SDG 10', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_10), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_10), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank10 <- Sdg_10[Sdg_10$TimePeriod == 2022,]
+rank10 <- rank10[order(-rank10$SDG10),]
+View(rank10)
+```
+
+```{r}
+outliergram(SDG_10,Fvalue = 1.5)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 11
+
+```{r}
+Sdg_11 <- datos_17SDG[,c(1,2,13)]
+data11 <- matrix(SDG11, nrow=23)
+data11 <- t(data11)
+SDG_11 <- fData(grid,data11) 
+plot(SDG_11,main = 'SDG 11', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_11), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_11), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank11 <- Sdg_11[Sdg_11$TimePeriod == 2022,]
+rank11 <- rank11[order(-rank11$SDG11),]
+View(rank11)
+```
+
+```{r}
+outliergram(SDG_11,Fvalue = 3)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 12
+
+```{r}
+Sdg_12 <- datos_17SDG[,c(1,2,14)]
+data12 <- matrix(SDG12, nrow=23)
+data12 <- t(data12)
+SDG_12 <- fData(grid,data12) 
+plot(SDG_12,main = 'SDG 12', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_12), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_12), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank12 <- Sdg_12[Sdg_12$TimePeriod == 2022,]
+rank12 <- rank12[order(-rank12$SDG12),]
+View(rank12)
+```
+
+```{r}
+outliergram(SDG_12,Fvalue = 4)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 14
+
+```{r}
+Sdg_14 <- datos_17SDG[,c(1,2,16)]
+data14 <- matrix(SDG14, nrow=23)
+data14 <- t(data14)
+SDG_14 <- fData(grid,data14) 
+plot(SDG_14,main = 'SDG 14', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_14), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_14), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank14 <- Sdg_14[Sdg_14$TimePeriod == 2022,]
+rank14 <- rank14[order(-rank14$SDG14),]
+View(rank14)
+```
+
+```{r}
+outliergram(SDG_14,Fvalue = 3)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 15
+
+```{r}
+Sdg_15 <- datos_17SDG[,c(1,2,17)]
+data15 <- matrix(SDG15, nrow=23)
+data15 <- t(data15)
+SDG_15 <- fData(grid,data15) 
+plot(SDG_15,main = 'SDG 15', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_15), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_15), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank15 <- Sdg_15[Sdg_15$TimePeriod == 2022,]
+rank15 <- rank15[order(-rank15$SDG15),]
+View(rank15)
+```
+
+```{r}
+outliergram(SDG_15,Fvalue = 10)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+# 16
+
+```{r}
+Sdg_16 <- datos_17SDG[,c(1,2,18)]
+data16 <- matrix(SDG16, nrow=23)
+data16 <- t(data16)
+SDG_16 <- fData(grid,data16) 
+plot(SDG_16,main = 'SDG 16', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_16), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_16), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank16 <- Sdg_16[Sdg_16$TimePeriod == 2022,]
+rank16 <- rank16[order(-rank16$SDG16),]
+View(rank16)
+```
+
+```{r}
+outliergram(SDG_16,Fvalue = 2)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+
+
+# 17
+
+```{r}
+Sdg_17 <- datos_17SDG[,c(1,2,19)]
+data17 <- matrix(SDG17, nrow=23)
+data17 <- t(data17)
+SDG_17 <- fData(grid,data17) 
+plot(SDG_17,main = 'SDG 17', xlab = 'Time', ylab = 'Index', lwd = 2)
+plot(mean(SDG_17), add = TRUE, lwd = 2, col = "black", lty = 2)
+plot(mean(SDG_17), main = "Mean of all countries",col='black', lwd = 2, lty = 2)
+```
+
+```{r}
+rank17 <- Sdg_17[Sdg_17$TimePeriod == 2022,]
+rank17 <- rank17[order(-rank17$SDG17),]
+View(rank17)
+```
+
+```{r}
+outliergram(SDG_17,Fvalue = 2)
+```
+
+```{r}
+anomalas2 <- Sdg_2[Sdg_2$GeoAreaName %in% countries[c(6,9,34,99,123,143)],]
+
+# Calcula la media de todas las series temporales
+media_global <- Sdg_1 %>%
+  group_by(TimePeriod) %>%
+  summarize(Media = mean(SDG1, na.rm = TRUE))
+
+# Crea el gráfico
+ggplot() +
+  geom_line(data = anomalas1, aes(x = TimePeriod, y = SDG1, color = GeoAreaName)) +
+  geom_line(data = media_global, aes(x = TimePeriod, y = Media, color = "Global Mean"), linetype = "dashed") +
+  labs(title = "Outlier countries against mean",
+       x = "Year",
+       y = "Value") +
+  scale_color_discrete(name = "Countries") +
+  theme_minimal()
+```
+# Detecting outliers using Ouliergram and Depthgram tools:
+
+First, we will create fData objects to enable the use of the `roahd` library, which provides the Outliergram and Depthgram tools.
+
+```{r}
+
+#data <- datos_completos
+data <- datos_17SDG
+chars <- names(data)
+grid <- 2000:2022
+
+for(i in 3:dim(data)[2]) {
+  variable_name <- paste0(chars[i])
+  spread_data <- t(spread(arrange(data[c(1,2,i)], TimePeriod), GeoAreaName, get(variable_name)))[-1,]
+  fvariable_name <- fData(grid, as.matrix(spread_data))
+  assign(variable_name, fvariable_name)
+}
+
+fDatas <- list()
+
+for (i in 3:dim(data)[2]) {
+  fDatas[[i-2]] <-get(chars[i])$values 
+  #fDatas <- append(fDatas,get(chars[i])$values)
+}
+```
+
+
+# The ouliergram
+
+The outliergram is a tool to visualize and detect shape outliers in samples of curves.
+
+
+
+ODS 1.4.1: By 2030, ensure that all men and women, in particular, the poor and the vulnerable, have equal rights to economic resources, as well as access to basic services, ownership, and control over land and other forms of property, inheritance, natural resources, appropriate new technology, and financial services, including microfinance.
+
+ODS 6.4.2: By 2030, substantially increase water-use efficiency across all sectors and ensure sustainable withdrawals and supply of freshwater to address water scarcity and substantially reduce the number of people suffering from water scarcity.
+
+ODS 9.a.1: Develop quality, reliable, sustainable, and resilient infrastructure, including regional and transborder infrastructure, to support economic development and human well-being, with a focus on affordable and equitable access for all.
+
+ODS 10.7.4: By 2030, facilitate orderly, safe, regular, and responsible migration and mobility of people, including through the implementation of planned and well-managed migration policies.
+
+ODS 4.1.2: By 2030, ensure that all girls and boys complete free, equitable, and quality primary and secondary education leading to relevant and effective learning outcomes.
+
+ODS 7.1.1: By 2030, ensure universal access to affordable, reliable, and modern energy services.
+
+
+```{r}
+# Definir los nombres de columna correspondientes
+#columnas <- names(sdg8[,-(1:2)])
+columnas <- names(datos_17SDG[,-(1:2)])
+# Crear una lista para almacenar los resultados
+resultados_outliergram <- list()
+resultados_fbplot <- list()
+
+# Bucle para ejecutar las operaciones con cada valor
+for (columna in columnas) {
+  # Ejecutar outliergram
+  print(columna)
+  o <- outliergram(get(columna))
+  bp <- fbplot(get(columna), main = columna)
+
+}
+```
+
+
+
+Creating multifunctionalData object and depthgram:
+
+```{r}
+mFDindicadores <- mfData(grid,fDatas)
+
+countries <- unique(data$GeoAreaName)
+
+subindi_depthgram <- depthgram(
+  mFDindicadores,
+  marginal_outliers = TRUE,
+  boxplot_factor = 1.5,
+  outliergram_factor = 1.5,
+  ids = countries
+)
+```
+
+Shape and magnitude outliers for each indicator:
+
+```{r}
+# Para ver shape otliers de cada variable
+#head(subindi_depthgram$shp.out.det)
+# Para ver magnitude otliers de cada variable
+#head(subindi_depthgram$mag.out.det)
+```
+
+Plotting the depthgram:
+
+```{r}
+plot_depthgram <- plot(subindi_depthgram,plot_title = 'SDGs depthgram',
+                   ids = countries)
+plot_depthgram
+```
+
+
+```{r}
+###################### Depthgram insights ##############
+
+
+# Paises muy por encima o por deajo de la media: Germany y Somalia:
+singapore <- data[data$GeoAreaName == 'Germany',]
+caf <- data[data$GeoAreaName == 'Niger',]
+par(mfrow=c(2,2))
+plot(median_fData(`SDG1`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG1`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG1`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG2`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG2`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG2`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG3`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG3`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG3`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG4`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG4`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG4`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG5`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG5`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG5`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG6`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG6`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG6`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG7`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG7`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG7`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG8`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG8`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG8`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG9`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG9`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG9`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG10`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG10`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG10`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG11`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG11`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG11`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG12`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG12`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG12`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG13`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG13`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG13`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG14`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG14`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG14`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG15`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG15`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG15`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG16`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG16`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG16`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG17`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG17`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG17`,ylim = c(0,100),type = 'l',col='red')
+```
+
+
+
+```{r}
+# Paises que sobresalen en el depthgram: Iraq and Serbia:
+
+singapore <- data[data$GeoAreaName == 'Iraq',]
+caf <- data[data$GeoAreaName == 'Serbia',]
+par(mfrow=c(2,2))
+plot(median_fData(`SDG1`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG1`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG1`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG2`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG2`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG2`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG3`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG3`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG3`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG4`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG4`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG4`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG5`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG5`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG5`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG6`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG6`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG6`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG7`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG7`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG7`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG8`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG8`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG8`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG9`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG9`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG9`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG10`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG10`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG10`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG11`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG11`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG11`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG12`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG12`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG12`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG13`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG13`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG13`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG14`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG14`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG14`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG15`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG15`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG15`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG16`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG16`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG16`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG17`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG17`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG17`,ylim = c(0,100),type = 'l',col='red')
+
+
+# Insights of Time and Time/Correlation Depthgram: India and Thailand:
+
+singapore <- data[data$GeoAreaName == 'India',]
+caf <- data[data$GeoAreaName == 'Thailand',]
+par(mfrow=c(2,2))
+plot(median_fData(`SDG1`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG1`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG1`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG2`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG2`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG2`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG3`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG3`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG3`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG4`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG4`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG4`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG5`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG5`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG5`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG6`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG6`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG6`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG7`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG7`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG7`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG8`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG8`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG8`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG9`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG9`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG9`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG10`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG10`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG10`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG11`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG11`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG11`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG12`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG12`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG12`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG13`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG13`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG13`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG14`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG14`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG14`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG15`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG15`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG15`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG16`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG16`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG16`,ylim = c(0,100),type = 'l',col='red')
+
+plot(median_fData(`SDG17`),ylim=c(0,100),col='black')
+points(grid,singapore$`SDG17`,ylim = c(0,100),type = 'l',col='green')
+points(grid,caf$`SDG17`,ylim = c(0,100),type = 'l',col='red')
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
